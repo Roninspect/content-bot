@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT Automation Agent</title>
+  <link rel="stylesheet" href="popup.css">
+  <!-- Include Google Font -->
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="logo-area">
+        <div class="logo-icon">🤖</div>
+        <div class="logo-text">
+          <h1>AutoAgent</h1>
+          <span>ChatGPT Content Automation</span>
+        </div>
+      </div>
+      <div class="status-badge" id="global-status">Idle</div>
+    </header>
+
+    <!-- Navigation Tabs -->
+    <nav class="tab-navigation">
+      <button class="tab-btn active" data-tab="dashboard">📊 Dashboard</button>
+      <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+    </nav>
+
+    <!-- Content Sections -->
+    <main class="tab-content">
+      <!-- Dashboard View -->
+      <section id="dashboard-view" class="view-panel active">
+        <!-- Stats Row -->
+        <div class="stats-container">
+          <div class="stat-card">
+            <span class="stat-label">Processed</span>
+            <span class="stat-value" id="stat-processed">0</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Remaining</span>
+            <span class="stat-value" id="stat-remaining">0</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">Total Batch</span>
+            <span class="stat-value" id="stat-total">0</span>
+          </div>
+        </div>
+
+        <!-- Progress Area -->
+        <div class="progress-section">
+          <div class="progress-header">
+            <span>Overall Progress</span>
+            <span id="progress-percentage">0%</span>
+          </div>
+          <div class="progress-bar-container">
+            <div class="progress-bar" id="progress-bar-fill" style="width: 0%"></div>
+          </div>
+        </div>
+
+        <!-- Control Buttons -->
+        <div class="controls-section">
+          <button id="btn-start" class="btn btn-start">
+            <span class="btn-icon">▶</span> Start Run
+          </button>
+          <button id="btn-pause" class="btn btn-pause" disabled>
+            <span class="btn-icon">⏸</span> Pause
+          </button>
+          <button id="btn-stop" class="btn btn-stop" disabled>
+            <span class="btn-icon">⏹</span> Stop
+          </button>
+        </div>
+
+        <!-- Logs / Terminal Console -->
+        <div class="logs-section">
+          <div class="logs-header">
+            <span>Console output</span>
+            <div style="display: flex; gap: 12px; align-items: center;">
+              <button id="btn-copy-logs" class="btn-text">📋 Copy Logs</button>
+              <button id="btn-clear-logs" class="btn-text">Clear Logs</button>
+            </div>
+          </div>
+          <div class="terminal-container" id="terminal-console">
+            <div class="log-line system-log">[System] Agent ready. Configure credentials in Settings and run.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings View -->
+      <section id="settings-view" class="view-panel">
+        <form id="settings-form" class="settings-form-scrollable">
+          
+          <!-- Automation Mode Selector -->
+          <div class="form-group-section" style="margin-bottom: 16px;">
+            <label for="automation-mode" class="switch-label" style="display: block; margin-bottom: 6px; font-weight: 600;">🤖 Automation Mode</label>
+            <select id="automation-mode" class="form-select" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid var(--border); background-color: var(--card-bg); color: var(--text-color);">
+              <option value="article">WordPress Article Publisher</option>
+              <option value="pinterest">Pinterest Pin Copywriter (Grok)</option>
+            </select>
+          </div>
+
+          <!-- Test Mode Switch Panel -->
+          <div class="form-group-section test-mode-panel">
+            <div class="test-mode-row">
+              <label for="test-mode-toggle" class="switch-label">🧪 Enable Test Mode</label>
+              <label class="switch">
+                <input type="checkbox" id="test-mode-toggle">
+                <span class="slider round"></span>
+              </label>
+            </div>
+            <span class="form-hint">Bypasses Supabase and WordPress validations. Pastes the prompt, scrapes ChatGPT, and downloads the output as a local document.</span>
+            
+            <div id="test-mode-fields" class="test-mode-fields">
+              <div class="form-group" style="margin-top: 12px; margin-bottom: 0;">
+                <label for="test-keywords">Test Keywords (one per line or comma-separated)</label>
+                <textarea id="test-keywords" rows="3" placeholder="High Protein Yogurt Bowl&#10;AI Content Automation" style="resize: vertical;"></textarea>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accordion 2: WordPress -->
+          <div class="accordion-item active" id="wordpress-accordion">
+            <button type="button" class="accordion-header">
+              <span class="accordion-title">🌐 WordPress Settings</span>
+              <span class="accordion-icon">▼</span>
+            </button>
+            <div class="accordion-content">
+              <div class="form-group">
+                <label for="wp-url">WP Site URL</label>
+                <input type="url" id="wp-url" placeholder="https://yourblog.com" required>
+              </div>
+              <div class="form-group">
+                <label for="wp-username">WP Username</label>
+                <input type="text" id="wp-username" placeholder="admin" required>
+              </div>
+              <div class="form-group">
+                <label for="wp-app-password">WP Application Password</label>
+                <input type="password" id="wp-app-password" placeholder="xxxx xxxx xxxx xxxx" required>
+              </div>
+              <div class="form-group">
+                <label for="wp-status">Post Publishing Status</label>
+                <select id="wp-status" class="form-select">
+                  <option value="draft">Draft</option>
+                  <option value="publish">Publish</option>
+                  <option value="schedule">Schedule</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="wp-category-id">Category ID (Optional)</label>
+                <input type="text" id="wp-category-id" placeholder="E.g., 5 or 3, 5">
+                <span class="form-hint">Numeric category ID(s). Leave empty for Default category.</span>
+              </div>
+              
+              <div id="schedule-fields" class="schedule-fields">
+                <div class="form-group" style="position: relative;">
+                  <label for="sched-start-date">Start Date</label>
+                  <input type="text" id="sched-start-date" placeholder="YYYY-MM-DD" readonly style="cursor: pointer;">
+                  <div id="calendar-picker" class="calendar-picker"></div>
+                </div>
+                <div class="form-group">
+                  <label for="sched-posts-per-day">Blogs Per Day</label>
+                  <input type="number" id="sched-posts-per-day" min="1" max="100" value="3">
+                </div>
+                <div class="form-group-row">
+                  <div class="form-group">
+                    <label for="sched-hours-start">Active Hours Start</label>
+                    <input type="time" id="sched-hours-start" value="08:00">
+                  </div>
+                  <div class="form-group">
+                    <label for="sched-hours-end">Active Hours End</label>
+                    <input type="time" id="sched-hours-end" value="22:00">
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Accordion 3: Automation & Prompt -->
+          <div class="accordion-item">
+            <button type="button" class="accordion-header">
+              <span class="accordion-title">⚙️ Automation & Prompt</span>
+              <span class="accordion-icon">▼</span>
+            </button>
+            <div class="accordion-content">
+              <div class="form-group-row">
+                <div class="form-group">
+                  <label for="sb-list-name">Keyword List Name</label>
+                  <input type="text" id="sb-list-name" placeholder="E.g., SEO Articles" required>
+                </div>
+                <div class="form-group">
+                  <label for="sb-batch-limit">Batch Limit</label>
+                  <input type="number" id="sb-batch-limit" value="100" min="1" max="1000" required>
+                </div>
+              </div>
+              
+              <div class="form-group">
+                <label for="action-delay">Action Delay (seconds)</label>
+                <input type="number" id="action-delay" value="10" min="1" max="300" required>
+              </div>
+
+              <div class="form-group" id="gpt-rewrite-switch-group">
+                <div class="switch-container-row">
+                  <label for="gpt-rewrite-toggle" class="switch-label-inline">✍️ Rewrite Intro with Custom GPT</label>
+                  <label class="switch">
+                    <input type="checkbox" id="gpt-rewrite-toggle">
+                    <span class="slider round"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div id="gpt-rewrite-fields" class="gpt-rewrite-fields">
+                <div class="form-group">
+                  <label for="custom-gpt-url">Custom GPT URL</label>
+                  <input type="url" id="custom-gpt-url" placeholder="https://chatgpt.com/g/g-xxxx-your-custom-gpt">
+                </div>
+              </div>
+
+              <div class="form-group" id="listicle-switch-group">
+                <div class="switch-container-row">
+                  <label for="listicle-toggle" class="switch-label-inline">📋 Listicle Mode</label>
+                  <label class="switch">
+                    <input type="checkbox" id="listicle-toggle">
+                    <span class="slider round"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div id="listicle-fields" class="listicle-fields">
+                <div class="form-group">
+                  <label for="listicle-gpt-url">Listicle GPT URL</label>
+                  <input type="url" id="listicle-gpt-url" placeholder="https://chatgpt.com/g/g-xxxx-your-listicle-gpt">
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label for="prompt-template">Prompt Template</label>
+                <textarea id="prompt-template" rows="4" placeholder="Use {keyword} as placeholder..." required></textarea>
+                <span class="form-hint">Tip: Use <code>{keyword}</code> for keyword injection. In Pinterest Copywriter mode, use <code>{annotations}</code> to inject annotated interests.</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-actions">
+            <button type="submit" id="btn-save-settings" class="btn btn-save">Save Settings</button>
+            <span class="save-status" id="save-status-msg"></span>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

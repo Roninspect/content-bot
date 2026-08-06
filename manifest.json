@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Content Automation Agent",
+  "version": "1.0.0",
+  "description": "Automate article generation via ChatGPT from Supabase keywords and publish directly to WordPress.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "alarms",
+    "declarativeNetRequest",
+    "downloads",
+    "clipboardRead",
+    "clipboardWrite"
+  ],
+  "host_permissions": [
+    "https://grok.com/*",
+    "https://chatgpt.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://grok.com/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
