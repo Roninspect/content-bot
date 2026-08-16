@@ -46,6 +46,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const wpStatusSelect = document.getElementById('wp-status');
   const wpCategoryIdInput = document.getElementById('wp-category-id');
   const actionDelayInput = document.getElementById('action-delay');
+  const concurrencySelect = document.getElementById('concurrency-limit');
   const promptTemplateInput = document.getElementById('prompt-template');
   const saveStatusMsg = document.getElementById('save-status-msg');
   const testModeToggle = document.getElementById('test-mode-toggle');
@@ -274,7 +275,7 @@ Output strictly in this JSON format, with no extra text before or after:
     chrome.storage.local.get([
       'automationMode', 'sbUrl', 'sbAnonKey', 'sbListName', 'sbBatchLimit',
       'wpUrl', 'wpUsername', 'wpAppPassword', 'wpStatus', 'wpCategoryId',
-      'actionDelay', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
+      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
       'schedStartDate', 'schedPostsPerDay', 'schedHoursStart', 'schedHoursEnd',
       'gptRewrite', 'customGptUrl', 'listicle', 'listicleGptUrl', 'testKeywords'
     ], (items) => {
@@ -292,6 +293,7 @@ Output strictly in this JSON format, with no extra text before or after:
       wpStatusSelect.value = items.wpStatus || 'draft';
       wpCategoryIdInput.value = items.wpCategoryId || '';
       actionDelayInput.value = items.actionDelay || 10;
+      concurrencySelect.value = items.concurrency || 2;
       
       cachedArticlePrompt = items.promptTemplate || DEFAULT_PROMPT;
       cachedPinterestPrompt = items.pinterestPromptTemplate || DEFAULT_PINTEREST_PROMPT;
@@ -352,6 +354,7 @@ Output strictly in this JSON format, with no extra text before or after:
       wpStatus: wpStatusSelect.value,
       wpCategoryId: wpCategoryIdInput.value.trim(),
       actionDelay: parseInt(actionDelayInput.value) || 10,
+      concurrency: parseInt(concurrencySelect.value) || 2,
       promptTemplate: cachedArticlePrompt,
       pinterestPromptTemplate: cachedPinterestPrompt,
       testMode: testModeToggle.checked,

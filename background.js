@@ -12,7 +12,7 @@ let state = {
   currentIndex: 0,
   failedKeywords: [],
   isRetryPhase: false,
-  activeTabId: null,
+  activeTabIds: [],
   logs: []
 };
 
@@ -36,14 +36,9 @@ loadState(() => {
 
 // Watch for manual tab closure
 chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === state.activeTabId) {
-    state.activeTabId = null;
-    if (state.status === 'RUNNING') {
-      addLog('warning', 'ChatGPT tab was closed manually. Pausing automation.');
-      state.status = 'PAUSED';
-      saveState();
-      broadcastState();
-    }
+  if (state.activeTabIds && state.activeTabIds.includes(tabId)) {
+    state.activeTabIds = state.activeTabIds.filter(id => id !== tabId);
+    saveState();
   }
 });
 
@@ -104,7 +99,7 @@ function getSettings() {
     chrome.storage.local.get([
       'automationMode', 'sbUrl', 'sbAnonKey', 'sbListName', 'sbBatchLimit',
       'wpUrl', 'wpUsername', 'wpAppPassword', 'wpStatus', 'wpCategoryId',
-      'actionDelay', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
+      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
       'schedStartDate', 'schedPostsPerDay', 'schedHoursStart', 'schedHoursEnd',
       'gptRewrite', 'customGptUrl', 'listicle', 'listicleGptUrl', 'testKeywords'
     ], (items) => {
@@ -120,6 +115,7 @@ function getSettings() {
         wpStatus: items.wpStatus || 'draft',
         wpCategoryId: items.wpCategoryId || '',
         actionDelay: parseInt(items.actionDelay) || 10,
+        concurrency: Math.max(1, Math.min(parseInt(items.concurrency) || 2, 3)),
         promptTemplate: items.promptTemplate || 'Write a 1500-word highly engaging SEO article about {keyword} containing headings and a summary.',
         pinterestPromptTemplate: items.pinterestPromptTemplate || `I need an engaging, SEO-optimized Pinterest title and description for the following keyword: "{keyword}"
 
@@ -444,29 +440,57 @@ function generateScheduleDates(totalKeywords, settings) {
   return dates;
 }
 
-// Helper to open a tab
+// Open a new tab
 function createTab(url) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.create({ url, active: true }, (tab) => {
+    chrome.tabs.create({ url, active: false }, (tab) => {
       if (chrome.runtime.lastError) {
         reject(new Error(chrome.runtime.lastError.message));
       } else {
+        registerActiveTab(tab.id);
         resolve(tab);
       }
     });
   });
 }
 
-// Helper to close the active automation tab
-function cleanupActiveTab() {
-  if (state.activeTabId) {
-    const tabId = state.activeTabId;
-    state.activeTabId = null;
+function registerActiveTab(tabId) {
+  if (!state.activeTabIds) state.activeTabIds = [];
+  if (!state.activeTabIds.includes(tabId)) {
+    state.activeTabIds.push(tabId);
+    saveState();
+  }
+}
+
+function unregisterActiveTab(tabId) {
+  if (!state.activeTabIds) state.activeTabIds = [];
+  state.activeTabIds = state.activeTabIds.filter(id => id !== tabId);
+  saveState();
+}
+
+// Helper to close a specific automation tab
+function cleanupTab(tabId) {
+  if (tabId) {
+    unregisterActiveTab(tabId);
     chrome.tabs.remove(tabId, () => {
       if (chrome.runtime.lastError) {
         // Swallowing error if already closed
       }
     });
+  }
+}
+
+// Helper to close all active automation tabs across all workers
+function cleanupAllActiveTabs() {
+  if (state.activeTabIds && state.activeTabIds.length > 0) {
+    const tabsToClose = [...state.activeTabIds];
+    state.activeTabIds = [];
+    saveState();
+    for (const tId of tabsToClose) {
+      chrome.tabs.remove(tId, () => {
+        if (chrome.runtime.lastError) {}
+      });
+    }
   }
 }
 
@@ -949,10 +973,429 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
   }
 }
 
-// --- STATE MACHINE ---
+// --- STATE MACHINE & CONCURRENT WORKER POOL ---
 
 let isProcessing = false;
 
+// --- WORKER PIPELINE: PINTEREST PIN COPYWRITER ---
+async function processPinterestKeyword(currentItem, itemIndex, totalCount, workerId, settings) {
+  const tag = `[Tab ${workerId} | "${currentItem.keyword}"]`;
+  const phaseStr = state.isRetryPhase ? '[Retry Phase] ' : '';
+  
+  addLog('info', `${tag} ${phaseStr}Processing keyword ${itemIndex + 1}/${totalCount}...`);
+  broadcastState();
+
+  // 1. Fetch active slots
+  let activeSlots = [];
+  if (settings.testMode) {
+    addLog('info', `${tag} [Test Mode] Mocking active image slots for testing...`);
+    activeSlots = [
+      { slot_index: 0, wp_image_url: 'https://mocksite.com/uploads/pin1.jpg' },
+      { slot_index: 1, wp_image_url: 'https://mocksite.com/uploads/pin2.jpg' }
+    ];
+  } else {
+    activeSlots = currentItem.pendingSlots || [];
+  }
+
+  if (activeSlots.length === 0) {
+    addLog('warning', `${tag} No slots requiring copywriting. Skipping.`);
+    state.stats.processed++;
+    state.stats.remaining = state.queue.length - state.stats.processed;
+    saveState();
+    broadcastState();
+    return;
+  }
+
+  addLog('info', `${tag} Found ${activeSlots.length} slot(s) requiring copywriting.`);
+  broadcastState();
+
+  // 2. Open dedicated Grok tab for this worker
+  const tab = await createTab('https://grok.com/');
+  
+  try {
+    addLog('info', `${tag} Waiting for Grok page to respond...`);
+    broadcastState();
+    const scriptReady = await waitForContentScriptReady(tab.id);
+    if (!scriptReady) {
+      throw new Error('Grok page content script response timeout.');
+    }
+
+    // 3. Process each slot sequentially within this worker's tab
+    for (let sIndex = 0; sIndex < activeSlots.length; sIndex++) {
+      if (state.status !== 'RUNNING') break;
+
+      const slot = activeSlots[sIndex];
+      addLog('info', `${tag} Slot ${slot.slot_index + 1}/${activeSlots.length} (Index: ${slot.slot_index})...`);
+      broadcastState();
+
+      // Construct prompt
+      const annotations = Array.isArray(currentItem.annotation_tags) ? currentItem.annotation_tags.join(', ') : '';
+      const promptText = settings.pinterestPromptTemplate
+        .replace(/{keyword}/gi, currentItem.keyword)
+        .replace(/{annotations}/gi, annotations);
+
+      addLog('info', `${tag} Submitting prompt for Slot ${slot.slot_index + 1}...`);
+      broadcastState();
+
+      if (state.status !== 'RUNNING') break;
+
+      const promptResult = await sendMessageToTab(tab.id, { action: 'enterPrompt', prompt: promptText });
+      if (promptResult.status !== 'success') {
+        throw new Error(`Failed to type/submit prompt: ${promptResult.message || 'unknown error'}`);
+      }
+
+      addLog('info', `${tag} Waiting for Slot ${slot.slot_index + 1} copywriting generation...`);
+      broadcastState();
+
+      if (state.status !== 'RUNNING') break;
+
+      try {
+        await pollGenerationComplete(tab.id, 600000);
+      } catch (pollErr) {
+        throw new Error(`Generation error: ${pollErr.message}`);
+      }
+
+      addLog('info', `${tag} Generation complete. Scraping response content...`);
+      broadcastState();
+
+      if (state.status !== 'RUNNING') break;
+
+      const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
+      if (extractResult.status !== 'success') {
+        throw new Error(`Extraction failed: ${extractResult.message}`);
+      }
+
+      const rawText = extractResult.markdown;
+      
+      // Extract JSON
+      let parsed = null;
+      try {
+        const startIdx = rawText.indexOf('{');
+        const endIdx = rawText.lastIndexOf('}');
+        if (startIdx !== -1 && endIdx !== -1) {
+          const jsonStr = rawText.slice(startIdx, endIdx + 1);
+          parsed = JSON.parse(jsonStr);
+        }
+      } catch (e) {
+        console.error('Failed to parse JSON:', e);
+      }
+
+      if (!parsed || !parsed.title || !parsed.description) {
+        addLog('error', `${tag} Grok response did not contain a valid JSON title and description for Slot ${slot.slot_index + 1}. Raw: ${rawText.substring(0, 150)}...`);
+        throw new Error('Failed to parse JSON containing title and description from Grok response.');
+      }
+
+      const pinTitle = parsed.title.trim();
+      const pinDesc = parsed.description.trim();
+
+      addLog('success', `${tag} Slot ${slot.slot_index + 1} Pin Copy:\nTitle: "${pinTitle}"\nDescription: "${pinDesc}"`);
+      broadcastState();
+
+      if (settings.testMode) {
+        addLog('info', `${tag} [Test Mode] Bypassing database update. Downloading result as JSON...`);
+        const testData = {
+          keyword: currentItem.keyword,
+          slot_index: slot.slot_index,
+          wp_image_url: slot.wp_image_url,
+          title: pinTitle,
+          description: pinDesc
+        };
+        chrome.downloads.download({
+          url: 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(testData, null, 2)),
+          filename: `test-pin-copy-slot-${slot.slot_index + 1}-${currentItem.keyword.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.json`,
+          saveAs: false
+        });
+      } else {
+        addLog('info', `${tag} Updating slot row in Supabase...`);
+        await updatePinImageSlot(settings, currentItem.id, slot.slot_index, pinTitle, pinDesc);
+        addLog('success', `${tag} Supabase slot row updated successfully.`);
+      }
+
+      // Slot cooldown
+      if (sIndex < activeSlots.length - 1 && settings.actionDelay > 0) {
+        addLog('info', `${tag} Waiting for slot cooldown delay of ${settings.actionDelay}s...`);
+        await delay(settings.actionDelay * 1000);
+      }
+    }
+
+    if (state.status === 'RUNNING') {
+      state.stats.processed++;
+      state.stats.remaining = state.queue.length - state.stats.processed;
+      saveState();
+      broadcastState();
+    }
+  } finally {
+    cleanupTab(tab.id);
+  }
+}
+
+// --- WORKER PIPELINE: WORDPRESS ARTICLE PUBLISHER ---
+async function processArticleKeyword(currentItem, itemIndex, totalCount, scheduleDate, workerId, settings) {
+  const tag = `[Tab ${workerId} | "${currentItem.keyword}"]`;
+  const phaseStr = state.isRetryPhase ? '[Retry Phase] ' : '';
+
+  addLog('info', `${tag} ${phaseStr}Processing keyword ${itemIndex + 1}/${totalCount}...`);
+  broadcastState();
+
+  // 1. Open Grok tab
+  const tab = await createTab('https://grok.com/');
+
+  let finalTitle = currentItem.keyword;
+  let finalMarkdown = '';
+  let finalHtml = '';
+  let parsedMd = { title: '', intro: '', body: '' };
+  let parsedHtml = { title: '', intro: '', body: '' };
+  let newIntroHtml = '';
+  let newIntroMarkdown = '';
+
+  try {
+    addLog('info', `${tag} Waiting for Grok page to respond...`);
+    broadcastState();
+    const scriptReady = await waitForContentScriptReady(tab.id);
+    if (!scriptReady) {
+      throw new Error('Grok page content script response timeout.');
+    }
+
+    // Submit prompt
+    const formattedPrompt = settings.promptTemplate.replace(/{keyword}/gi, currentItem.keyword)
+      + '\n\nIMPORTANT: Do not attach the article as a file, document, or download block. You must write the entire article directly in the chat message response.';
+    addLog('info', `${tag} Submitting prompt to Grok...`);
+    broadcastState();
+
+    if (state.status !== 'RUNNING') return;
+
+    const promptResult = await sendMessageToTab(tab.id, { action: 'enterPrompt', prompt: formattedPrompt });
+    if (promptResult.status !== 'success') {
+      throw new Error(`Failed to type/submit prompt: ${promptResult.message || 'unknown error'}`);
+    }
+
+    addLog('info', `${tag} Article generation streaming... waiting for completion.`);
+    broadcastState();
+
+    if (state.status !== 'RUNNING') return;
+
+    try {
+      await pollGenerationComplete(tab.id, 600000);
+    } catch (pollErr) {
+      throw new Error(`Generation error: ${pollErr.message}`);
+    }
+
+    addLog('info', `${tag} Generation complete. Scraping article content...`);
+    broadcastState();
+
+    if (state.status !== 'RUNNING') return;
+
+    const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
+    if (extractResult.status !== 'success') {
+      throw new Error(`Extraction failed: ${extractResult.message}`);
+    }
+
+    const articleHtml = extractResult.content;
+    const articleMarkdown = extractResult.markdown;
+    const grokPreview = articleMarkdown.split('\n').filter(l => l.trim()).slice(0, 5).join('\n');
+    addLog('success', `${tag} Scraped Grok Article Preview:\n${grokPreview}`);
+    broadcastState();
+
+    parsedMd = parseGrokOutput(articleMarkdown);
+    parsedHtml = parseHtmlGrokOutput(articleHtml);
+
+    if (parsedMd.title || parsedHtml.title) {
+      finalTitle = parsedMd.title || parsedHtml.title;
+      addLog('info', `${tag} Extracted title from Grok: "${finalTitle}"`);
+    }
+
+    finalMarkdown = `${parsedMd.intro}\n\n${parsedMd.body}`.trim();
+    finalHtml = `${parsedHtml.intro}\n\n${parsedHtml.body}`.trim();
+
+  } finally {
+    cleanupTab(tab.id);
+  }
+
+  if (state.status !== 'RUNNING') return;
+
+  // 2. Custom GPT Intro Rewrite (if configured)
+  if (settings.gptRewrite && settings.customGptUrl) {
+    addLog('info', `${tag} Navigating to Custom GPT: ${settings.customGptUrl}`);
+    broadcastState();
+
+    const gptTab = await createTab(settings.customGptUrl);
+
+    try {
+      addLog('info', `${tag} Waiting for Custom GPT page to respond...`);
+      broadcastState();
+      const gptReady = await waitForContentScriptReady(gptTab.id);
+      if (!gptReady) {
+        throw new Error('Custom GPT content script response timeout.');
+      }
+
+      await new Promise(r => setTimeout(r, 4000));
+
+      addLog('info', `${tag} Submitting keyword to Custom GPT...`);
+      broadcastState();
+      const promptResult = await sendMessageToTab(gptTab.id, { action: 'enterPrompt', prompt: currentItem.keyword });
+      if (promptResult.status !== 'success') {
+        throw new Error(`Failed to submit keyword to Custom GPT: ${promptResult.message}`);
+      }
+
+      addLog('info', `${tag} Custom GPT intro generation streaming...`);
+      broadcastState();
+      try {
+        await pollGptIntroComplete(gptTab.id, 600000);
+      } catch (pollErr) {
+        throw new Error(`Custom GPT generation failed: ${pollErr.message}`);
+      }
+
+      const extractResult = await sendMessageToTab(gptTab.id, { action: 'waitForGptIntro' });
+      if (extractResult.status !== 'success') {
+        throw new Error(`Custom GPT extraction failed: ${extractResult.message}`);
+      }
+
+      newIntroHtml = extractResult.content;
+      newIntroMarkdown = extractResult.markdown;
+
+      const wordCount = newIntroMarkdown.split(/\s+/).filter(Boolean).length;
+      addLog('success', `${tag} Extracted intro (${wordCount} words): "${newIntroMarkdown.substring(0, 80).replace(/\n/g, ' ')}..."`);
+      broadcastState();
+
+      if (wordCount < 15) {
+        throw new Error(`Custom GPT introduction was too short or empty (${wordCount} words).`);
+      }
+
+      finalMarkdown = `${newIntroMarkdown}\n\n${parsedMd.body}`.trim();
+      finalHtml = `${newIntroHtml}\n\n${parsedHtml.body}`.trim();
+
+    } finally {
+      cleanupTab(gptTab.id);
+    }
+  }
+
+  if (state.status !== 'RUNNING') return;
+
+  // 3. Listicle GPT Section (if configured)
+  if (settings.listicle && settings.listicleGptUrl) {
+    addLog('info', `${tag} Listicle Mode enabled. Navigating to Listicle GPT: ${settings.listicleGptUrl}`);
+    broadcastState();
+
+    const listicleTab = await createTab(settings.listicleGptUrl);
+
+    try {
+      addLog('info', `${tag} Waiting for Listicle GPT page to respond...`);
+      broadcastState();
+      const listicleReady = await waitForContentScriptReady(listicleTab.id);
+      if (!listicleReady) {
+        throw new Error('Listicle GPT content script response timeout.');
+      }
+
+      await new Promise(r => setTimeout(r, 4000));
+
+      addLog('info', `${tag} Submitting keyword to Listicle GPT: "${currentItem.keyword}"...`);
+      broadcastState();
+
+      const listiclePromptResult = await sendMessageToTab(listicleTab.id, { action: 'enterPrompt', prompt: currentItem.keyword });
+      if (listiclePromptResult.status !== 'success') {
+        throw new Error(`Failed to submit keyword to Listicle GPT: ${listiclePromptResult.message}`);
+      }
+
+      addLog('info', `${tag} Listicle GPT generation streaming...`);
+      broadcastState();
+      try {
+        await pollGptIntroComplete(listicleTab.id, 600000);
+      } catch (pollErr) {
+        throw new Error(`Listicle GPT generation failed: ${pollErr.message}`);
+      }
+
+      const extractResult = await sendMessageToTab(listicleTab.id, { action: 'waitForGptIntro' });
+      if (extractResult.status !== 'success') {
+        throw new Error(`Listicle GPT extraction failed: ${extractResult.message}`);
+      }
+
+      const listicleSectionHtml = extractResult.content;
+      const listicleSectionMarkdown = extractResult.markdown;
+      const listicleWordCount = listicleSectionMarkdown.split(/\s+/).filter(Boolean).length;
+      if (listicleWordCount < 15) {
+        throw new Error(`Listicle GPT section was too short or empty (${listicleWordCount} words).`);
+      }
+
+      addLog('success', `${tag} Listicle section extracted (${listicleWordCount} words). Splicing...`);
+      broadcastState();
+
+      if (settings.gptRewrite && settings.customGptUrl) {
+        finalMarkdown = `${newIntroMarkdown}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
+        finalHtml = `${newIntroHtml}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
+      } else {
+        finalMarkdown = `${parsedMd.intro}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
+        finalHtml = `${parsedHtml.intro}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
+      }
+
+    } finally {
+      cleanupTab(listicleTab.id);
+    }
+  }
+
+  if (state.status !== 'RUNNING') return;
+
+  // 4. Publish / Download Output
+  if (settings.testMode) {
+    addLog('info', `${tag} [Test Mode] Bypassing WordPress/Supabase. Downloading Markdown file...`);
+    broadcastState();
+
+    const safeKw = finalTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const dateSuffix = scheduleDate ? `-${scheduleDate.replace(/[:]/g, '_')}` : '';
+    chrome.downloads.download({
+      url: 'data:text/markdown;charset=utf-8,' + encodeURIComponent(finalMarkdown),
+      filename: `test-article-${safeKw}${dateSuffix}.md`,
+      saveAs: false
+    }, (downloadId) => {
+      if (chrome.downloads.lastError) {
+        addLog('error', `${tag} [Test Mode] Download failed: ${chrome.downloads.lastError.message}`);
+      } else {
+        const schedMsg = scheduleDate ? ` (simulated schedule: ${scheduleDate})` : '';
+        addLog('success', `${tag} [Test Mode] Markdown document downloaded${schedMsg}. ID: ${downloadId}`);
+      }
+      broadcastState();
+    });
+
+    state.stats.processed++;
+    state.stats.remaining = state.queue.length - state.stats.processed;
+    saveState();
+    broadcastState();
+  } else {
+    if (scheduleDate) {
+      addLog('info', `${tag} Publishing to WordPress (scheduled: ${scheduleDate})...`);
+    } else {
+      addLog('info', `${tag} Publishing to WordPress as "${settings.wpStatus}"...`);
+    }
+    broadcastState();
+
+    const slug = sanitizeSlug(currentItem.keyword) || sanitizeSlug(finalTitle);
+    addLog('info', `${tag} Checking WordPress for existing slug: "${slug}"...`);
+    broadcastState();
+
+    const wpResult = await publishToWordPress(settings, finalTitle, finalHtml, slug, scheduleDate);
+    if (!wpResult.success) {
+      throw new Error(`WordPress publishing failed: ${wpResult.message}`);
+    }
+    if (wpResult.duplicate) {
+      addLog('warning', `${tag} Existing WordPress post found. Duplicate creation skipped. ID: ${wpResult.postId}.`);
+    } else {
+      addLog('success', `${tag} Post published to WordPress! ID: ${wpResult.postId}`);
+    }
+    broadcastState();
+
+    addLog('info', `${tag} Updating Supabase status to completed...`);
+    broadcastState();
+    await updateKeywordStatus(settings, currentItem.id, 'completed');
+    addLog('success', `${tag} Supabase updated successfully.`);
+    broadcastState();
+
+    state.stats.processed++;
+    state.stats.remaining = state.queue.length - state.stats.processed;
+    saveState();
+    broadcastState();
+  }
+}
+
+// --- STATE MACHINE DISPATCHER ---
 async function runStateMachine(isInternal = false) {
   if (state.status !== 'RUNNING') {
     isProcessing = false;
@@ -976,7 +1419,8 @@ async function runStateMachine(isInternal = false) {
         const rawKws = settings.testKeywords || '';
         const kwList = rawKws.split(/[\n,]/).map(k => k.trim()).filter(Boolean);
         if (kwList.length === 0) {
-          kwList.push('High Protein Yogurt Bowl'); // Fallback default
+          kwList.push('High Protein Yogurt Bowl');
+          kwList.push('Easy Fall Container Gardening');
         }
         
         state.queue = kwList.map((kw, i) => ({ id: `test-kw-${i}`, keyword: kw }));
@@ -1007,6 +1451,7 @@ async function runStateMachine(isInternal = false) {
           state.status = 'IDLE';
           saveState();
           broadcastState();
+          isProcessing = false;
           return;
         }
         addLog('info', `Resolved List ID: ${listId}`);
@@ -1017,7 +1462,6 @@ async function runStateMachine(isInternal = false) {
           broadcastState();
           const rawKeywords = await fetchGrokKeywords(settings, listId);
           
-          // Filter in JS to only keep keywords that have active slots requiring copywriting
           const filteredQueue = rawKeywords.map(kw => {
             const pendingSlots = (kw.pin_images || []).filter(s => 
               s.wp_image_url && 
@@ -1037,6 +1481,7 @@ async function runStateMachine(isInternal = false) {
             state.status = 'IDLE';
             saveState();
             broadcastState();
+            isProcessing = false;
             return;
           }
           state.queue = filteredQueue;
@@ -1049,6 +1494,7 @@ async function runStateMachine(isInternal = false) {
             state.status = 'IDLE';
             saveState();
             broadcastState();
+            isProcessing = false;
             return;
           }
           state.queue = keywords;
@@ -1074,542 +1520,109 @@ async function runStateMachine(isInternal = false) {
       }
     }
 
-    // Process keyword at current index
-    if (state.currentIndex < state.queue.length) {
-      const currentItem = state.queue[state.currentIndex];
+    // Launch multi-tab worker pool
+    const total = state.queue.length;
+    const concurrency = Math.max(1, Math.min(settings.concurrency || 2, total - state.currentIndex, 3));
+    addLog('info', `Running worker pool with concurrency: ${concurrency} parallel tab(s)...`);
+    broadcastState();
 
-      if (settings.automationMode === 'pinterest') {
-        const phaseStr = state.isRetryPhase ? '[Retry Phase] ' : '';
-        addLog('info', `${phaseStr}Pinterest Copywriter: Processing keyword ${state.currentIndex + 1}/${state.queue.length}: "${currentItem.keyword}"`);
+    let nextQueueIndex = state.currentIndex;
+
+    async function runWorker(workerId) {
+      while (state.status === 'RUNNING') {
+        if (nextQueueIndex >= total) break;
+        const itemIndex = nextQueueIndex++;
+        state.currentIndex = nextQueueIndex;
+        saveState();
         broadcastState();
 
-        // 1. Fetch active slots
-        let activeSlots = [];
+        const currentItem = state.queue[itemIndex];
+        if (!currentItem) break;
 
-        if (settings.testMode) {
-          addLog('info', '[Test Mode] Mocking active image slots for testing...');
-          activeSlots = [
-            { slot_index: 0, wp_image_url: 'https://mocksite.com/uploads/pin1.jpg' },
-            { slot_index: 1, wp_image_url: 'https://mocksite.com/uploads/pin2.jpg' }
-          ];
-        } else {
-          addLog('info', `Retrieving pre-loaded active slots for keyword: "${currentItem.keyword}"...`);
-          activeSlots = currentItem.pendingSlots || [];
-        }
-
-        addLog('info', `Found ${activeSlots.length} slot(s) requiring copywriting.`);
-        broadcastState();
-
-        if (activeSlots.length === 0) {
-          addLog('warning', `No slots requiring copywriting (either empty or already completed) for keyword: "${currentItem.keyword}". Skipping.`);
+        try {
+          if (settings.automationMode === 'pinterest') {
+            await processPinterestKeyword(currentItem, itemIndex, total, workerId, settings);
+          } else {
+            const scheduleDate = state.scheduleDates && state.scheduleDates[itemIndex] ? state.scheduleDates[itemIndex] : null;
+            await processArticleKeyword(currentItem, itemIndex, total, scheduleDate, workerId, settings);
+          }
+        } catch (err) {
+          addLog('error', `[Tab ${workerId} | "${currentItem.keyword}"] Failed: ${err.message}`);
+          if (!state.isRetryPhase) {
+            state.failedKeywords.push(currentItem);
+          }
           state.stats.processed++;
-          state.stats.remaining = state.queue.length - state.stats.processed;
-        } else {
-          // 2. Open Grok tab
-          cleanupActiveTab();
-          const tab = await createTab('https://grok.com/');
-          state.activeTabId = tab.id;
+          state.stats.remaining = total - state.stats.processed;
           saveState();
           broadcastState();
 
-          addLog('info', 'Waiting for Grok page to respond...');
-          broadcastState();
-          const scriptReady = await waitForContentScriptReady(tab.id);
-          if (!scriptReady) {
-            throw new Error('Grok page content script response timeout.');
-          }
-
-          // 3. Process each slot
-          for (let sIndex = 0; sIndex < activeSlots.length; sIndex++) {
-            const slot = activeSlots[sIndex];
-            addLog('info', `Processing Slot ${slot.slot_index + 1}/${activeSlots.length} (Index: ${slot.slot_index})...`);
-            broadcastState();
-
-            // Construct prompt
-            const annotations = Array.isArray(currentItem.annotation_tags) ? currentItem.annotation_tags.join(', ') : '';
-            const promptText = settings.pinterestPromptTemplate
-              .replace(/{keyword}/gi, currentItem.keyword)
-              .replace(/{annotations}/gi, annotations);
-
-            addLog('info', `Submitting prompt for Slot ${slot.slot_index + 1}...`);
-            broadcastState();
-
-            if (state.status !== 'RUNNING') return;
-
-            const promptResult = await sendMessageToTab(tab.id, { action: 'enterPrompt', prompt: promptText });
-            if (promptResult.status !== 'success') {
-              throw new Error(`Failed to type/submit prompt: ${promptResult.message || 'unknown error'}`);
-            }
-
-            addLog('info', `Waiting for Slot ${slot.slot_index + 1} copywriting generation...`);
-            broadcastState();
-
-            if (state.status !== 'RUNNING') return;
-
+          if (settings.automationMode === 'article' && !settings.testMode) {
             try {
-              await pollGenerationComplete(tab.id, 600000);
-            } catch (pollErr) {
-              throw new Error(`Generation error: ${pollErr.message}`);
-            }
-
-            addLog('info', 'Generation complete. Scraping response content...');
-            broadcastState();
-
-            if (state.status !== 'RUNNING') return;
-
-            const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
-            if (extractResult.status !== 'success') {
-              throw new Error(`Extraction failed: ${extractResult.message}`);
-            }
-
-            const rawText = extractResult.markdown;
-            
-            // Extract JSON
-            let parsed = null;
-            try {
-              const startIdx = rawText.indexOf('{');
-              const endIdx = rawText.lastIndexOf('}');
-              if (startIdx !== -1 && endIdx !== -1) {
-                const jsonStr = rawText.slice(startIdx, endIdx + 1);
-                parsed = JSON.parse(jsonStr);
-              }
-            } catch (e) {
-              console.error('Failed to parse JSON:', e);
-            }
-
-            if (!parsed || !parsed.title || !parsed.description) {
-              addLog('error', `Grok response did not contain a valid JSON title and description for Slot ${slot.slot_index + 1}. Raw text: ${rawText.substring(0, 150)}...`);
-              throw new Error('Failed to parse JSON containing title and description from Grok response.');
-            }
-
-            const pinTitle = parsed.title.trim();
-            const pinDesc = parsed.description.trim();
-
-            addLog('success', `Generated Pin Copy for Slot ${slot.slot_index + 1}:\nTitle: "${pinTitle}"\nDescription: "${pinDesc}"`);
-            broadcastState();
-
-            if (settings.testMode) {
-              addLog('info', `[Test Mode] Bypassing Supabase database update. Downloading result as JSON...`);
-              const testData = {
-                keyword: currentItem.keyword,
-                slot_index: slot.slot_index,
-                wp_image_url: slot.wp_image_url,
-                title: pinTitle,
-                description: pinDesc
-              };
-              chrome.downloads.download({
-                url: 'data:application/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(testData, null, 2)),
-                filename: `test-pin-copy-slot-${slot.slot_index + 1}-${currentItem.keyword.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.json`,
-                saveAs: false
-              });
-            } else {
-              addLog('info', `Updating slot row in Supabase...`);
-              await updatePinImageSlot(settings, currentItem.id, slot.slot_index, pinTitle, pinDesc);
-              addLog('success', `Supabase slot row updated successfully.`);
-            }
-
-            // Cooldown delay between multiple slots for the same keyword
-            if (sIndex < activeSlots.length - 1) {
-              addLog('info', `Waiting for slot cooldown delay of ${settings.actionDelay}s...`);
-              await delay(settings.actionDelay * 1000);
-            }
+              await updateKeywordStatus(settings, currentItem.id, 'failed');
+            } catch(e) {}
           }
-
-          // Completed copywriting for all slots of this keyword
-
-          state.stats.processed++;
-          state.stats.remaining = state.queue.length - state.stats.processed;
         }
 
-        // Clean up and proceed
-        cleanupActiveTab();
-        state.currentIndex++;
-        saveState();
-        broadcastState();
-
-        if (state.currentIndex < state.queue.length) {
-          addLog('info', `Waiting for keyword cooldown delay of ${settings.actionDelay}s...`);
+        if (state.status === 'RUNNING' && nextQueueIndex < total && settings.actionDelay > 0) {
+          addLog('info', `[Tab ${workerId}] Waiting for cooldown delay of ${settings.actionDelay}s...`);
           await delay(settings.actionDelay * 1000);
-          runStateMachine(true);
-        } else {
-          runStateMachine(true);
         }
-        return;
-      }
-
-      const phaseStr = state.isRetryPhase ? '[Retry Phase] ' : '';
-      
-      addLog('info', `${phaseStr}Processing keyword ${state.currentIndex + 1}/${state.queue.length}: "${currentItem.keyword}"`);
-      broadcastState();
-
-      // Spawn single Grok tab
-      cleanupActiveTab(); // safety
-      const tab = await createTab('https://grok.com/');
-      state.activeTabId = tab.id;
-      saveState();
-      broadcastState();
-
-      // Wait for content script load
-      addLog('info', 'Waiting for Grok page to respond...');
-      broadcastState();
-      const scriptReady = await waitForContentScriptReady(tab.id);
-      if (!scriptReady) {
-        throw new Error('Grok page content script response timeout.');
-      }
-
-      // Fill prompt
-      const formattedPrompt = settings.promptTemplate.replace(/{keyword}/gi, currentItem.keyword)
-        + '\n\nIMPORTANT: Do not attach the article as a file, document, or download block. You must write the entire article directly in the chat message response.';
-      addLog('info', 'Submitting prompt...');
-      broadcastState();
-      
-      if (state.status !== 'RUNNING') return; // handle user pause/stop
-      
-      const promptResult = await sendMessageToTab(tab.id, { action: 'enterPrompt', prompt: formattedPrompt });
-      if (promptResult.status !== 'success') {
-        throw new Error(`Failed to type/submit prompt: ${promptResult.message || 'unknown error'}`);
-      }
-
-      // Wait for generation complete with 90s safety timeout
-      addLog('info', 'Article generation streaming... waiting for completion.');
-      broadcastState();
-      
-      if (state.status !== 'RUNNING') return;
-      
-      try {
-        await pollGenerationComplete(tab.id, 600000);
-      } catch (pollErr) {
-        throw new Error(`Generation error: ${pollErr.message}`);
-      }
-
-      // Extract output HTML
-      addLog('info', 'Generation complete. Scraping article content...');
-      broadcastState();
-      
-      if (state.status !== 'RUNNING') return;
-      
-      const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
-      if (extractResult.status !== 'success') {
-        throw new Error(`Extraction failed: ${extractResult.message}`);
-      }
-      
-      const articleHtml = extractResult.content;
-      const articleMarkdown = extractResult.markdown;
-      const grokPreview = articleMarkdown.split('\n').filter(l => l.trim()).slice(0, 6).join('\n');
-      addLog('success', `Scraped Grok Article Preview:\n${grokPreview}`);
-      broadcastState();
-
-      // 1. Always extract the catchy title and split Grok's output into title/intro/body
-      const parsedMd = parseGrokOutput(articleMarkdown);
-      const parsedHtml = parseHtmlGrokOutput(articleHtml);
-      
-      let finalTitle = currentItem.keyword;
-      if (parsedMd.title || parsedHtml.title) {
-        finalTitle = parsedMd.title || parsedHtml.title;
-        addLog('info', `Extracted catchy title from Grok: "${finalTitle}"`);
-      }
-
-      // 2. Default content is the Grok article stripped of the title
-      let finalMarkdown = `${parsedMd.intro}\n\n${parsedMd.body}`.trim();
-      let finalHtml = `${parsedHtml.intro}\n\n${parsedHtml.body}`.trim();
-      let newIntroHtml = '';
-      let newIntroMarkdown = '';
-
-      // Handle Custom GPT Intro rewrite if configured
-      if (settings.gptRewrite && settings.customGptUrl) {
-        addLog('info', `Navigating to Custom GPT URL: ${settings.customGptUrl}`);
-        broadcastState();
-
-        // Clean up Grok tab and open GPT
-        cleanupActiveTab();
-        const gptTab = await createTab(settings.customGptUrl);
-        state.activeTabId = gptTab.id;
-        saveState();
-        broadcastState();
-
-        addLog('info', 'Waiting for Custom GPT page to respond...');
-        broadcastState();
-        const gptReady = await waitForContentScriptReady(gptTab.id);
-        if (!gptReady) {
-          throw new Error('Custom GPT content script response timeout.');
-        }
-
-        // Wiggle room for custom GPT assets to load
-        await new Promise(r => setTimeout(r, 4000));
-
-        addLog('info', `Submitting raw keyword: "${currentItem.keyword}"...`);
-        broadcastState();
-        const promptResult = await sendMessageToTab(gptTab.id, { action: 'enterPrompt', prompt: currentItem.keyword });
-        if (promptResult.status !== 'success') {
-          throw new Error(`Failed to submit keyword to Custom GPT: ${promptResult.message}`);
-        }
-
-        addLog('info', 'Custom GPT intro generation streaming and waiting for compilation...');
-        broadcastState();
-        try {
-          await pollGptIntroComplete(gptTab.id, 600000);
-        } catch (pollErr) {
-          throw new Error(`Custom GPT generation failed: ${pollErr.message}`);
-        }
-
-        const extractResult = await sendMessageToTab(gptTab.id, { action: 'waitForGptIntro' });
-        if (extractResult.status !== 'success') {
-          throw new Error(`Custom GPT extraction failed: ${extractResult.message}`);
-        }
-
-        newIntroHtml = extractResult.content;
-        newIntroMarkdown = extractResult.markdown;
-
-        // Verify intro length
-        const wordCount = newIntroMarkdown.split(/\s+/).filter(Boolean).length;
-        addLog('success', `Extracted intro (${wordCount} words): "${newIntroMarkdown.substring(0, 80).replace(/\n/g, ' ')}..."`);
-        broadcastState();
-
-        if (wordCount < 15) {
-          throw new Error(`Custom GPT introduction was too short or empty (${wordCount} words).`);
-        }
-
-        addLog('success', 'Splicing new introduction with original body...');
-        broadcastState();
-
-        // Final Splice (intro + body, listicle gets inserted below if enabled)
-        finalMarkdown = `${newIntroMarkdown}\n\n${parsedMd.body}`.trim();
-        finalHtml = `${newIntroHtml}\n\n${parsedHtml.body}`.trim();
-
-        // Clean up GPT tab
-        cleanupActiveTab();
-      }
-
-      // Handle Listicle GPT section if configured
-      if (settings.listicle && settings.listicleGptUrl) {
-        addLog('info', `Listicle Mode enabled. Navigating to Listicle GPT: ${settings.listicleGptUrl}`);
-        broadcastState();
-
-        if (state.status !== 'RUNNING') return;
-
-        const listicleTab = await createTab(settings.listicleGptUrl);
-        state.activeTabId = listicleTab.id;
-        saveState();
-        broadcastState();
-
-        addLog('info', 'Waiting for Listicle GPT page to respond...');
-        broadcastState();
-        const listicleReady = await waitForContentScriptReady(listicleTab.id);
-        if (!listicleReady) {
-          throw new Error('Listicle GPT content script response timeout.');
-        }
-
-        // Wiggle room for custom GPT assets to load
-        await new Promise(r => setTimeout(r, 4000));
-
-        addLog('info', `Submitting raw keyword to Listicle GPT: "${currentItem.keyword}"...`);
-        broadcastState();
-
-        if (state.status !== 'RUNNING') return;
-
-        const listiclePromptResult = await sendMessageToTab(listicleTab.id, { action: 'enterPrompt', prompt: currentItem.keyword });
-        if (listiclePromptResult.status !== 'success') {
-          throw new Error(`Failed to submit keyword to Listicle GPT: ${listiclePromptResult.message}`);
-        }
-
-        addLog('info', 'Listicle GPT generation streaming and waiting for compilation...');
-        broadcastState();
-        try {
-          await pollGptIntroComplete(listicleTab.id, 600000);
-        } catch (pollErr) {
-          throw new Error(`Listicle GPT generation failed: ${pollErr.message}`);
-        }
-
-        const extractResult = await sendMessageToTab(listicleTab.id, { action: 'waitForGptIntro' });
-        if (extractResult.status !== 'success') {
-          throw new Error(`Listicle GPT extraction failed: ${extractResult.message}`);
-        }
-
-        const listicleSectionHtml = extractResult.content;
-        const listicleSectionMarkdown = extractResult.markdown;
-
-        // Verify listicle section length
-        const listicleWordCount = listicleSectionMarkdown.split(/\s+/).filter(Boolean).length;
-        if (listicleWordCount < 15) {
-          throw new Error(`Listicle GPT section was too short or empty (${listicleWordCount} words).`);
-        }
-
-        addLog('success', `Listicle section extracted (${listicleWordCount} words). Splicing after intro...`);
-        broadcastState();
-
-        // Re-splice: insert listicle section between intro and body
-        if (settings.gptRewrite && settings.customGptUrl) {
-          // We already have parsed pieces — reconstruct with listicle in between
-          finalMarkdown = `${newIntroMarkdown}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
-          finalHtml = `${newIntroHtml}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
-        } else {
-          // No intro rewrite — parse the original article and insert listicle after its intro
-          finalMarkdown = `${parsedMd.intro}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
-          finalHtml = `${parsedHtml.intro}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
-        }
-
-        // Clean up Listicle GPT tab
-        cleanupActiveTab();
-      }
-      
-      if (settings.testMode) {
-        const scheduleDate = state.scheduleDates && state.scheduleDates[state.currentIndex] ? state.scheduleDates[state.currentIndex] : null;
-        addLog('info', '[Test Mode] Bypassing WordPress/Supabase. Downloading generated content as Markdown file...');
-        broadcastState();
-
-        const safeKw = finalTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-        const dateSuffix = scheduleDate ? `-${scheduleDate.replace(/[:]/g, '_')}` : '';
-        chrome.downloads.download({
-          url: 'data:text/markdown;charset=utf-8,' + encodeURIComponent(finalMarkdown),
-          filename: `test-article-${safeKw}${dateSuffix}.md`,
-          saveAs: false
-        }, (downloadId) => {
-          if (chrome.downloads.lastError) {
-            addLog('error', `[Test Mode] Download failed: ${chrome.downloads.lastError.message}`);
-          } else {
-            const schedMsg = scheduleDate ? ` (simulated schedule: ${scheduleDate})` : '';
-            addLog('success', `[Test Mode] Markdown document downloaded successfully${schedMsg}. ID: ${downloadId}`);
-          }
-          broadcastState();
-        });
-
-        // Update counters
-        state.stats.processed++;
-        state.stats.remaining = state.queue.length - state.stats.processed;
-      } else {
-        // Publish to WordPress
-        const scheduleDate = state.scheduleDates && state.scheduleDates[state.currentIndex] ? state.scheduleDates[state.currentIndex] : null;
-        if (scheduleDate) {
-          addLog('info', `Publishing to WordPress (scheduled for: ${scheduleDate})...`);
-        } else {
-          addLog('info', `Publishing to WordPress as "${settings.wpStatus}"...`);
-        }
-        broadcastState();
-        
-        if (state.status !== 'RUNNING') return;
-        
-        const slug = sanitizeSlug(currentItem.keyword) || sanitizeSlug(finalTitle);
-        addLog('info', `Checking WordPress for existing slug: "${slug}"...`);
-        broadcastState();
-
-        const wpResult = await publishToWordPress(settings, finalTitle, finalHtml, slug, scheduleDate);
-        if (!wpResult.success) {
-          throw new Error(`WordPress publishing failed: ${wpResult.message}`);
-        }
-        if (wpResult.duplicate) {
-          addLog('warning', `Existing WordPress post found. Duplicate creation skipped. ID: ${wpResult.postId}, status: ${wpResult.postStatus || 'unknown'}.`);
-        } else {
-          addLog('success', `Post published to WordPress! ID: ${wpResult.postId}`);
-        }
-        broadcastState();
-
-        // Update status in Supabase
-        addLog('info', 'Updating Supabase status to completed...');
-        broadcastState();
-        await updateKeywordStatus(settings, currentItem.id, 'completed');
-        addLog('success', `Supabase updated successfully.`);
-        broadcastState();
-
-        // Update counters
-        state.stats.processed++;
-        state.stats.remaining = state.queue.length - state.stats.processed;
-      }
-
-    } else {
-      // Index reached the end of queue. Check if retry is needed.
-      if (state.failedKeywords.length > 0 && !state.isRetryPhase) {
-        addLog('warning', `Batch finished with ${state.failedKeywords.length} failed items. Launching single retry phase...`);
-        state.queue = [...state.failedKeywords];
-        state.currentIndex = 0;
-        state.stats.total = state.queue.length;
-        state.stats.processed = 0;
-        state.stats.remaining = state.queue.length;
-        state.failedKeywords = [];
-        state.isRetryPhase = true;
-        saveState();
-        broadcastState();
-
-        // Wait cooldown and loop back
-        addLog('info', `Waiting for cooldown delay of ${settings.actionDelay}s...`);
-        await delay(settings.actionDelay * 1000);
-        runStateMachine(true);
-        return;
-      } else {
-        // Complete
-        addLog('success', 'All automation tasks completed successfully!');
-        state.status = 'COMPLETED';
-        state.queue = [];
-        state.currentIndex = 0;
-        cleanupActiveTab();
-        saveState();
-        broadcastState();
-        isProcessing = false;
-        return;
       }
     }
 
-    // Keyword finished successfully, transition to next
-    cleanupActiveTab();
-    state.currentIndex++;
-    state.stats.remaining = state.queue.length - state.currentIndex;
-    saveState();
-    broadcastState();
-
-    if (state.currentIndex < state.queue.length) {
-      addLog('info', `Waiting for cooldown delay of ${settings.actionDelay}s...`);
-      await delay(settings.actionDelay * 1000);
-      runStateMachine(true);
-    } else {
-      runStateMachine(true);
+    const workerPromises = [];
+    for (let w = 1; w <= concurrency; w++) {
+      workerPromises.push(
+        (async () => {
+          if (w > 1) await delay((w - 1) * 1500); // 1.5s stagger between tab openings
+          return runWorker(w);
+        })()
+      );
     }
 
-  } catch (err) {
-    addLog('error', err.message);
-    
-    // If the queue is empty, the error happened during initialization (e.g. database connection or query error)
-    if (!state.queue || state.queue.length === 0) {
-      addLog('error', 'Automation aborted during initialization phase.');
-      state.status = 'IDLE';
+    await Promise.all(workerPromises);
+
+    if (state.status !== 'RUNNING') {
       isProcessing = false;
-      saveState();
-      broadcastState();
       return;
     }
 
-    // Fail current keyword
-    if (state.queue && state.queue[state.currentIndex]) {
-      const failedItem = state.queue[state.currentIndex];
-      
-      try {
-        const settings = await getSettings();
-        if (settings.automationMode !== 'pinterest') {
-          await updateKeywordStatus(settings, failedItem.id, 'failed');
-          addLog('warning', `Marked keyword "${failedItem.keyword || failedItem.id}" as failed in Supabase.`);
-        }
-      } catch (dbErr) {
-        addLog('error', `Failed to mark status in database: ${dbErr.message}`);
-      }
+    // Check if retry phase needed
+    if (state.failedKeywords.length > 0 && !state.isRetryPhase) {
+      addLog('warning', `Batch finished with ${state.failedKeywords.length} failed items. Launching single retry phase...`);
+      state.queue = [...state.failedKeywords];
+      state.currentIndex = 0;
+      state.stats.total = state.queue.length;
+      state.stats.processed = 0;
+      state.stats.remaining = state.queue.length;
+      state.failedKeywords = [];
+      state.isRetryPhase = true;
+      saveState();
+      broadcastState();
 
-      if (!state.isRetryPhase) {
-        state.failedKeywords.push(failedItem);
-      }
+      addLog('info', `Waiting for cooldown delay of ${settings.actionDelay}s before retry...`);
+      await delay(settings.actionDelay * 1000);
+      isProcessing = false;
+      runStateMachine(true);
+      return;
+    } else {
+      addLog('success', 'All automation tasks completed successfully!');
+      state.status = 'COMPLETED';
+      state.queue = [];
+      state.currentIndex = 0;
+      cleanupAllActiveTabs();
+      saveState();
+      broadcastState();
+      isProcessing = false;
     }
 
-    // Cooldown and proceed
-    cleanupActiveTab();
-    state.currentIndex++;
-    state.stats.remaining = state.queue.length - state.currentIndex;
+  } catch (err) {
+    addLog('error', `Automation error: ${err.message}`);
+    state.status = 'IDLE';
+    isProcessing = false;
+    cleanupAllActiveTabs();
     saveState();
     broadcastState();
-
-    const settings = await getSettings();
-    if (state.currentIndex < state.queue.length) {
-      addLog('info', `Waiting for cooldown delay of ${settings.actionDelay}s...`);
-      await delay(settings.actionDelay * 1000);
-      runStateMachine(true);
-    } else {
-      runStateMachine(true);
-    }
   }
 }
 
@@ -1652,7 +1665,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       state.status = 'PAUSED';
       isProcessing = false;
       addLog('warning', 'Automation paused.');
-      cleanupActiveTab();
+      cleanupAllActiveTabs();
       saveState();
       broadcastState();
     }
@@ -1664,7 +1677,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     state.status = 'IDLE';
     isProcessing = false;
     addLog('warning', 'Automation stopped.');
-    cleanupActiveTab();
+    cleanupAllActiveTabs();
     state.queue = [];
     state.currentIndex = 0;
     state.stats = { processed: 0, remaining: 0, total: 0 };
