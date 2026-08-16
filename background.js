@@ -133,7 +133,7 @@ Title requirements:
 - Maximum 70 characters.
 
 Description requirements:
-- 500–600 characters.
+- 400–480 characters (Strict maximum: Must NEVER exceed 500 characters).
 - Naturally incorporate 4–5 relevant keywords/long-tail phrases (from the keyword itself and, where applicable, the filtered annotations) — no forced or unnatural insertion.
 - Must read naturally, like it's written for humans first, search engines second.
 
@@ -811,6 +811,32 @@ function sanitizeSlug(text) {
     .replace(/-+/g, '-');        // Replace multiple consecutive hyphens with a single one
 }
 
+// Smartly enforces Pinterest 500-character limit by trimming at sentence/word boundary
+function enforceDescriptionLimit(desc, maxLen = 490) {
+  if (!desc) return '';
+  let text = desc.trim();
+  if (text.length <= 500) {
+    return text;
+  }
+  
+  // Cut to maxLen window
+  let sub = text.substring(0, maxLen);
+  
+  // Try to find the last sentence boundary (. ! ?)
+  const lastPeriod = Math.max(sub.lastIndexOf('.'), sub.lastIndexOf('!'), sub.lastIndexOf('?'));
+  if (lastPeriod > 250) {
+    return sub.substring(0, lastPeriod + 1).trim();
+  }
+  
+  // Fall back to last space
+  const lastSpace = sub.lastIndexOf(' ');
+  if (lastSpace > 250) {
+    return sub.substring(0, lastSpace).trim() + '.';
+  }
+  
+  return sub.trim();
+}
+
 // Find an existing WordPress post by its exact slug before creating a new one.
 async function findExistingWordPressPost(settings, slug) {
   if (!slug) {
@@ -976,6 +1002,7 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
 // --- STATE MACHINE & CONCURRENT WORKER POOL ---
 
 let isProcessing = false;
+const activeRunTitles = new Set();
 
 // --- WORKER PIPELINE: PINTEREST PIN COPYWRITER ---
 async function processPinterestKeyword(currentItem, itemIndex, totalCount, workerId, settings) {
@@ -1085,10 +1112,24 @@ async function processPinterestKeyword(currentItem, itemIndex, totalCount, worke
         throw new Error('Failed to parse JSON containing title and description from Grok response.');
       }
 
-      const pinTitle = parsed.title.trim();
-      const pinDesc = parsed.description.trim();
+      let pinTitle = parsed.title.trim();
+      const rawPinDesc = parsed.description.trim();
 
-      addLog('success', `${tag} Slot ${slot.slot_index + 1} Pin Copy:\nTitle: "${pinTitle}"\nDescription: "${pinDesc}"`);
+      // Enforce Description <= 500 characters
+      const pinDesc = enforceDescriptionLimit(rawPinDesc, 490);
+      if (rawPinDesc.length > 500) {
+        addLog('info', `${tag} Description was ${rawPinDesc.length} chars (exceeded 500 limit). Trimmed cleanly to ${pinDesc.length} chars.`);
+      }
+
+      // Title deduplication check against current batch
+      const normTitle = pinTitle.toLowerCase();
+      if (activeRunTitles.has(normTitle)) {
+        addLog('warning', `${tag} Title "${pinTitle}" was already used in this batch. Generating unique variation...`);
+        pinTitle = `${pinTitle} | Top Ideas`.substring(0, 70).trim();
+      }
+      activeRunTitles.add(pinTitle.toLowerCase());
+
+      addLog('success', `${tag} Slot ${slot.slot_index + 1} Pin Copy (${pinDesc.length} chars):\nTitle: "${pinTitle}"\nDescription: "${pinDesc}"`);
       broadcastState();
 
       if (settings.testMode) {
@@ -1458,16 +1499,43 @@ async function runStateMachine(isInternal = false) {
         broadcastState();
 
         if (settings.automationMode === 'pinterest') {
-          addLog('info', `Fetching Pinterest keywords and pre-loading slots (Limit: ${settings.sbBatchLimit})...`);
+          activeRunTitles.clear();
+          addLog('info', `Fetching Pinterest keywords and scanning existing slots for quality issues (Limit: ${settings.sbBatchLimit})...`);
           broadcastState();
           const rawKeywords = await fetchGrokKeywords(settings, listId);
           
+          // Pass 1: Build Title frequency map across all existing slots in the list
+          const titleCountMap = new Map();
+          for (const kw of rawKeywords) {
+            for (const s of (kw.pin_images || [])) {
+              if (s.title && s.title.trim()) {
+                const norm = s.title.trim().toLowerCase();
+                titleCountMap.set(norm, (titleCountMap.get(norm) || 0) + 1);
+              }
+            }
+          }
+
+          let missingCopyCount = 0;
+          let tooLongCount = 0;
+          let duplicateTitleCount = 0;
+
+          // Pass 2: Filter keywords & slots that need copywriting / re-creation
           const filteredQueue = rawKeywords.map(kw => {
-            const pendingSlots = (kw.pin_images || []).filter(s => 
-              s.wp_image_url && 
-              s.wp_image_url.trim() !== '' && 
-              (!s.title || s.title.trim() === '' || !s.description || s.description.trim() === '')
-            );
+            const pendingSlots = (kw.pin_images || []).filter(s => {
+              if (!s.wp_image_url || s.wp_image_url.trim() === '') {
+                return false; // Skip slots without images
+              }
+              const isMissing = !s.title || s.title.trim() === '' || !s.description || s.description.trim() === '';
+              const isTooLong = s.description && s.description.trim().length > 500;
+              const isDuplicateTitle = s.title && s.title.trim() && titleCountMap.get(s.title.trim().toLowerCase()) > 1;
+
+              if (isMissing) missingCopyCount++;
+              else if (isTooLong) tooLongCount++;
+              else if (isDuplicateTitle) duplicateTitleCount++;
+
+              return isMissing || isTooLong || isDuplicateTitle;
+            });
+
             return {
               id: kw.id,
               keyword: kw.keyword,
@@ -1476,8 +1544,11 @@ async function runStateMachine(isInternal = false) {
             };
           }).filter(kw => kw.pendingSlots.length > 0);
 
+          addLog('info', `[Quality Audit] Scan complete: ${missingCopyCount} missing copy, ${tooLongCount} descriptions > 500 chars, ${duplicateTitleCount} duplicate titles flagged for re-creation.`);
+          broadcastState();
+
           if (filteredQueue.length === 0) {
-            addLog('warning', 'No Pinterest keywords found with image slots requiring copywriting.');
+            addLog('success', 'All Pinterest keywords and slots already have valid, unique copy (≤ 500 chars). No updates needed.');
             state.status = 'IDLE';
             saveState();
             broadcastState();

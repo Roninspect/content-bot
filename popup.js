@@ -212,7 +212,7 @@ Title requirements:
 - Maximum 70 characters.
 
 Description requirements:
-- 500–600 characters.
+- 400–480 characters (Strict maximum: Must NEVER exceed 500 characters).
 - Naturally incorporate 4–5 relevant keywords/long-tail phrases (from the keyword itself and, where applicable, the filtered annotations) — no forced or unnatural insertion.
 - Must read naturally, like it's written for humans first, search engines second.
 
