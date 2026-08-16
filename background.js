@@ -774,6 +774,65 @@ async function fetchActiveImageSlots(settings, keywordId) {
   return await response.json();
 }
 
+// Scans and audits all keywords & slots in a Pinterest list for quality issues (missing, >500 chars, duplicate titles)
+async function auditPinterestList(settings, listId) {
+  const rawKeywords = await fetchGrokKeywords(settings, listId);
+  
+  // Pass 1: Build Title frequency map across all existing slots in the list
+  const titleCountMap = new Map();
+  for (const kw of rawKeywords) {
+    for (const s of (kw.pin_images || [])) {
+      if (s.title && s.title.trim()) {
+        const norm = s.title.trim().toLowerCase();
+        titleCountMap.set(norm, (titleCountMap.get(norm) || 0) + 1);
+      }
+    }
+  }
+
+  let missingCopyCount = 0;
+  let tooLongCount = 0;
+  let duplicateTitleCount = 0;
+
+  // Pass 2: Filter keywords & slots that need copywriting / re-creation
+  const filteredQueue = rawKeywords.map(kw => {
+    const allTitlesForKw = (kw.pin_images || [])
+      .map(s => s.title && s.title.trim())
+      .filter(Boolean);
+
+    const pendingSlots = (kw.pin_images || []).filter(s => {
+      if (!s.wp_image_url || s.wp_image_url.trim() === '') {
+        return false; // Skip slots without images
+      }
+      const isMissing = !s.title || s.title.trim() === '' || !s.description || s.description.trim() === '';
+      const isTooLong = s.description && s.description.trim().length > 500;
+      const isDuplicateTitle = s.title && s.title.trim() && titleCountMap.get(s.title.trim().toLowerCase()) > 1;
+
+      if (isMissing) missingCopyCount++;
+      else if (isTooLong) tooLongCount++;
+      else if (isDuplicateTitle) duplicateTitleCount++;
+
+      return isMissing || isTooLong || isDuplicateTitle;
+    });
+
+    return {
+      id: kw.id,
+      keyword: kw.keyword,
+      annotation_tags: kw.annotation_tags,
+      allExistingTitles: allTitlesForKw,
+      pendingSlots: pendingSlots
+    };
+  }).filter(kw => kw.pendingSlots.length > 0);
+
+  return {
+    rawKeywords,
+    filteredQueue,
+    missingCopyCount,
+    tooLongCount,
+    duplicateTitleCount,
+    totalIssues: missingCopyCount + tooLongCount + duplicateTitleCount
+  };
+}
+
 // Update Pin Image Slot copy
 async function updatePinImageSlot(settings, keywordId, slotIndex, title, description) {
   const sbUrl = settings.sbUrl.replace(/\/$/, '');
@@ -1055,11 +1114,29 @@ async function processPinterestKeyword(currentItem, itemIndex, totalCount, worke
       addLog('info', `${tag} Slot ${slot.slot_index + 1}/${activeSlots.length} (Index: ${slot.slot_index})...`);
       broadcastState();
 
-      // Construct prompt
+      // Construct prompt with excluded titles
       const annotations = Array.isArray(currentItem.annotation_tags) ? currentItem.annotation_tags.join(', ') : '';
-      const promptText = settings.pinterestPromptTemplate
+      let promptText = settings.pinterestPromptTemplate
         .replace(/{keyword}/gi, currentItem.keyword)
         .replace(/{annotations}/gi, annotations);
+
+      // Collect titles already used for this keyword or flagged as duplicates
+      const excludedTitles = [];
+      if (slot.title && slot.title.trim()) {
+        excludedTitles.push(slot.title.trim());
+      }
+      if (Array.isArray(currentItem.allExistingTitles)) {
+        for (const t of currentItem.allExistingTitles) {
+          if (t && t.trim() && !excludedTitles.includes(t.trim())) {
+            excludedTitles.push(t.trim());
+          }
+        }
+      }
+
+      if (excludedTitles.length > 0) {
+        const titlesList = excludedTitles.slice(0, 6).map(t => `- "${t}"`).join('\n');
+        promptText += `\n\nCRITICAL TITLE RULE:\nDo NOT use, copy, or repeat any of the following already-used titles (you must write a completely new, unique title):\n${titlesList}`;
+      }
 
       addLog('info', `${tag} Submitting prompt for Slot ${slot.slot_index + 1}...`);
       broadcastState();
@@ -1500,54 +1577,14 @@ async function runStateMachine(isInternal = false) {
 
         if (settings.automationMode === 'pinterest') {
           activeRunTitles.clear();
-          addLog('info', `Fetching Pinterest keywords and scanning existing slots for quality issues (Limit: ${settings.sbBatchLimit})...`);
+          addLog('info', `Scanning Pinterest list "${settings.sbListName}" for quality issues (Limit: ${settings.sbBatchLimit})...`);
           broadcastState();
-          const rawKeywords = await fetchGrokKeywords(settings, listId);
           
-          // Pass 1: Build Title frequency map across all existing slots in the list
-          const titleCountMap = new Map();
-          for (const kw of rawKeywords) {
-            for (const s of (kw.pin_images || [])) {
-              if (s.title && s.title.trim()) {
-                const norm = s.title.trim().toLowerCase();
-                titleCountMap.set(norm, (titleCountMap.get(norm) || 0) + 1);
-              }
-            }
-          }
-
-          let missingCopyCount = 0;
-          let tooLongCount = 0;
-          let duplicateTitleCount = 0;
-
-          // Pass 2: Filter keywords & slots that need copywriting / re-creation
-          const filteredQueue = rawKeywords.map(kw => {
-            const pendingSlots = (kw.pin_images || []).filter(s => {
-              if (!s.wp_image_url || s.wp_image_url.trim() === '') {
-                return false; // Skip slots without images
-              }
-              const isMissing = !s.title || s.title.trim() === '' || !s.description || s.description.trim() === '';
-              const isTooLong = s.description && s.description.trim().length > 500;
-              const isDuplicateTitle = s.title && s.title.trim() && titleCountMap.get(s.title.trim().toLowerCase()) > 1;
-
-              if (isMissing) missingCopyCount++;
-              else if (isTooLong) tooLongCount++;
-              else if (isDuplicateTitle) duplicateTitleCount++;
-
-              return isMissing || isTooLong || isDuplicateTitle;
-            });
-
-            return {
-              id: kw.id,
-              keyword: kw.keyword,
-              annotation_tags: kw.annotation_tags,
-              pendingSlots: pendingSlots
-            };
-          }).filter(kw => kw.pendingSlots.length > 0);
-
-          addLog('info', `[Quality Audit] Scan complete: ${missingCopyCount} missing copy, ${tooLongCount} descriptions > 500 chars, ${duplicateTitleCount} duplicate titles flagged for re-creation.`);
+          const audit = await auditPinterestList(settings, listId);
+          addLog('info', `[Quality Audit] Scan complete: ${audit.missingCopyCount} missing copy, ${audit.tooLongCount} descriptions > 500 chars, ${audit.duplicateTitleCount} duplicate titles flagged.`);
           broadcastState();
 
-          if (filteredQueue.length === 0) {
+          if (audit.filteredQueue.length === 0) {
             addLog('success', 'All Pinterest keywords and slots already have valid, unique copy (≤ 500 chars). No updates needed.');
             state.status = 'IDLE';
             saveState();
@@ -1555,7 +1592,8 @@ async function runStateMachine(isInternal = false) {
             isProcessing = false;
             return;
           }
-          state.queue = filteredQueue;
+          state.queue = audit.filteredQueue;
+          state.resolutionPass = 1;
         } else {
           addLog('info', `Fetching pending and failed keywords (Limit: ${settings.sbBatchLimit})...`);
           broadcastState();
@@ -1658,8 +1696,40 @@ async function runStateMachine(isInternal = false) {
       return;
     }
 
-    // Check if retry phase needed
-    if (state.failedKeywords.length > 0 && !state.isRetryPhase) {
+    // Check if Pinterest quality re-audit loop needed
+    if (settings.automationMode === 'pinterest' && !settings.testMode) {
+      addLog('info', 'Pass completed. Re-auditing Pinterest list in Supabase to verify all issues are resolved...');
+      broadcastState();
+
+      const listId = await fetchListId(settings);
+      const audit = await auditPinterestList(settings, listId);
+
+      if (audit.totalIssues > 0) {
+        state.resolutionPass = (state.resolutionPass || 1) + 1;
+        if (state.resolutionPass > 5) {
+          addLog('warning', `Reached maximum safety limit of 5 resolution passes. Finished with ${audit.totalIssues} unresolved slots.`);
+        } else {
+          addLog('warning', `[Quality Audit Loop] Found ${audit.totalIssues} remaining slots with issues (${audit.missingCopyCount} missing, ${audit.tooLongCount} > 500 chars, ${audit.duplicateTitleCount} duplicate titles). Auto-launching Resolution Pass ${state.resolutionPass}...`);
+          state.queue = audit.filteredQueue;
+          state.currentIndex = 0;
+          state.stats.total = state.queue.length;
+          state.stats.processed = 0;
+          state.stats.remaining = state.queue.length;
+          state.failedKeywords = [];
+          state.isRetryPhase = true;
+          saveState();
+          broadcastState();
+
+          addLog('info', `Waiting for cooldown delay of ${settings.actionDelay}s before Pass ${state.resolutionPass}...`);
+          await delay(settings.actionDelay * 1000);
+          isProcessing = false;
+          runStateMachine(true);
+          return;
+        }
+      } else {
+        addLog('success', 'All Pinterest slots in the list are 100% resolved with unique titles and valid descriptions (≤ 500 chars)!');
+      }
+    } else if (state.failedKeywords.length > 0 && !state.isRetryPhase) {
       addLog('warning', `Batch finished with ${state.failedKeywords.length} failed items. Launching single retry phase...`);
       state.queue = [...state.failedKeywords];
       state.currentIndex = 0;
@@ -1676,16 +1746,16 @@ async function runStateMachine(isInternal = false) {
       isProcessing = false;
       runStateMachine(true);
       return;
-    } else {
-      addLog('success', 'All automation tasks completed successfully!');
-      state.status = 'COMPLETED';
-      state.queue = [];
-      state.currentIndex = 0;
-      cleanupAllActiveTabs();
-      saveState();
-      broadcastState();
-      isProcessing = false;
     }
+
+    addLog('success', 'All automation tasks completed successfully!');
+    state.status = 'COMPLETED';
+    state.queue = [];
+    state.currentIndex = 0;
+    cleanupAllActiveTabs();
+    saveState();
+    broadcastState();
+    isProcessing = false;
 
   } catch (err) {
     addLog('error', `Automation error: ${err.message}`);
