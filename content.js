@@ -113,51 +113,86 @@ function findStopButton() {
   }
 }
 
-// Dedicated helper to locate genuine Copy button inside or adjacent to response bubble
+// Dedicated helper to locate genuine Message-level Copy button (excluding code block copy buttons)
 function findCopyButton(container) {
   if (!container) return null;
-  const parentMessage = container.closest('[class*="message"], [data-testid*="message"]') || container.parentElement || container;
-  
-  const btn = parentMessage.querySelector('button[aria-label="Copy" i]')
-           || parentMessage.querySelector('button[aria-label*="Copy" i]')
-           || parentMessage.querySelector('button[data-testid*="copy" i]')
-           || Array.from(parentMessage.querySelectorAll('button')).find(b => {
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                const testId = (b.getAttribute('data-testid') || '').toLowerCase();
-                const title = (b.getAttribute('title') || '').toLowerCase();
-                return (label.includes('copy') || testId.includes('copy') || title.includes('copy')) && !label.includes('code');
-              });
-  return btn || null;
+  const parentMessage = container.closest('[data-testid*="message"], [class*="message-row"], [class*="response"], [class*="chat-message"]') 
+                     || container.closest('[class*="message"]') 
+                     || container.parentElement 
+                     || container;
+
+  // 1. Look in message action bars / footers (bottom of message)
+  const actionBars = parentMessage.querySelectorAll('[class*="action"], [class*="toolbar"], [class*="footer"], [class*="bottom"]');
+  for (const bar of Array.from(actionBars).reverse()) {
+    if (bar.closest('pre, code, [class*="code"], [class*="syntax"]')) continue;
+
+    const copyBtn = bar.querySelector('button[aria-label="Copy" i]')
+                 || bar.querySelector('button[aria-label*="Copy" i]')
+                 || bar.querySelector('button[data-testid*="copy" i]')
+                 || bar.querySelector('button[title*="Copy" i]');
+    if (copyBtn) return copyBtn;
+  }
+
+  // 2. Search all buttons inside message excluding code block containers
+  const allButtons = Array.from(parentMessage.querySelectorAll('button')).filter(b => {
+    return !b.closest('pre, code, [class*="code"], [class*="syntax"]');
+  });
+
+  const messageCopyBtn = allButtons.reverse().find(b => {
+    const label = (b.getAttribute('aria-label') || '').toLowerCase();
+    const testId = (b.getAttribute('data-testid') || '').toLowerCase();
+    const title = (b.getAttribute('title') || '').toLowerCase();
+    return (label.includes('copy') || testId.includes('copy') || title.includes('copy')) && !label.includes('code');
+  });
+
+  if (messageCopyBtn) return messageCopyBtn;
+
+  // 3. Fallback: Search the document for the last non-code copy button
+  if (isGrok) {
+    const grokButtons = Array.from(document.querySelectorAll('button')).filter(b => {
+      if (b.closest('pre, code, [class*="code"]')) return false;
+      const label = (b.getAttribute('aria-label') || '').toLowerCase();
+      const title = (b.getAttribute('title') || '').toLowerCase();
+      return (label.includes('copy') || title.includes('copy')) && !label.includes('code');
+    });
+    if (grokButtons.length > 0) {
+      return grokButtons[grokButtons.length - 1];
+    }
+  }
+
+  return null;
 }
 
 // Locate the last assistant response container (for standard chats)
 function findLastAssistantResponse() {
   if (isGrok) {
-    const selectors = [
-      '.markdown',
-      '.message-content',
-      '[data-testid="message-content"]',
-      '[class*="message-text"]',
-      '[class*="message-body"]'
-    ];
-    for (const selector of selectors) {
-      const blocks = document.querySelectorAll(selector);
-      if (blocks.length > 0) return blocks[blocks.length - 1];
+    const messageRows = document.querySelectorAll('[data-testid*="message-row"], [class*="message-row"], [class*="response-container"], [data-testid*="message"]');
+    if (messageRows.length > 0) {
+      return messageRows[messageRows.length - 1];
     }
-    const genericBlocks = document.querySelectorAll('[class*="message"], [class*="bubble"]');
-    if (genericBlocks.length > 0) return genericBlocks[genericBlocks.length - 1];
+
+    const genericBlocks = document.querySelectorAll('[class*="message-bubble"], [class*="response"], [class*="bubble"]');
+    if (genericBlocks.length > 0) {
+      return genericBlocks[genericBlocks.length - 1];
+    }
+
+    const blocks = document.querySelectorAll('.markdown, .message-content, [data-testid="message-content"], [class*="message-text"], [class*="message-body"]');
+    if (blocks.length > 0) {
+      const lastBlock = blocks[blocks.length - 1];
+      return lastBlock.closest('[class*="message"], [class*="bubble"], [class*="response"]') || lastBlock.parentElement || lastBlock;
+    }
     return null;
   } else {
     // ChatGPT: Standard inline bubble check
     const assistants = document.querySelectorAll('div[data-message-author-role="assistant"]');
     if (assistants.length > 0) {
-      const lastAssistant = assistants[assistants.length - 1];
-      return lastAssistant.querySelector('.markdown') 
-          || lastAssistant.querySelector('.prose') 
-          || lastAssistant;
+      return assistants[assistants.length - 1];
     }
     const markdownBlocks = document.querySelectorAll('.markdown.prose, .prose');
-    if (markdownBlocks.length > 0) return markdownBlocks[markdownBlocks.length - 1];
+    if (markdownBlocks.length > 0) {
+      const lastMd = markdownBlocks[markdownBlocks.length - 1];
+      return lastMd.closest('div[data-message-author-role="assistant"]') || lastMd;
+    }
     return null;
   }
 }
@@ -209,11 +244,20 @@ async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
         btn.click();
 
         // Clipboard write delay
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, 450));
 
         const text = await navigator.clipboard.readText();
         if (text && text.trim().length >= 20) {
-          return text.trim();
+          const domWordCount = (assistantNode.innerText || '').split(/\s+/).filter(Boolean).length;
+          const copiedWordCount = text.split(/\s+/).filter(Boolean).length;
+
+          // If the DOM clearly has a large article (>200 words) but clipboard only received a tiny sub-snippet (<80 words)
+          if (domWordCount > 200 && copiedWordCount < 80) {
+            console.warn(`[AutoAgent] Copied snippet was only ${copiedWordCount} words while message has ${domWordCount} words. Retrying with message-level button...`);
+          } else {
+            console.log(`[AutoAgent] Successfully extracted ${copiedWordCount} words via native copy button.`);
+            return text.trim();
+          }
         }
       } catch (err) {
         console.warn(`[AutoAgent] Copy button clipboard read attempt ${attempt} failed:`, err.message);
