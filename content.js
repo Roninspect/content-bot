@@ -241,6 +241,8 @@ async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
     if (btn) {
       try {
         console.log(`[AutoAgent] Clicking standard copy button (attempt ${attempt})...`);
+        window.focus();
+        btn.focus();
         btn.click();
 
         // Clipboard write delay
@@ -260,13 +262,28 @@ async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
           }
         }
       } catch (err) {
-        console.warn(`[AutoAgent] Copy button clipboard read attempt ${attempt} failed:`, err.message);
+        console.warn(`[AutoAgent] Copy button clipboard read attempt ${attempt} failed: ${err.message}`);
+        if (err.message && err.message.includes('Document is not focused')) {
+          console.log('[AutoAgent] Tab unfocused for clipboard API. Extracting structured Markdown from DOM HTML...');
+          const converted = htmlToMarkdown(assistantNode.innerHTML);
+          if (converted && converted.length >= 50) {
+            const convertedWords = converted.split(/\s+/).filter(Boolean).length;
+            console.log(`[AutoAgent] Successfully compiled ${convertedWords} words of structured Markdown from DOM HTML.`);
+            return converted;
+          }
+        }
       }
     } else {
       console.log(`[AutoAgent] Waiting for copy button to appear (attempt ${attempt}/${maxRetries})...`);
     }
 
     await new Promise(r => setTimeout(r, 600));
+  }
+
+  // Fallback to structured HTML-to-Markdown conversion
+  const convertedFallback = htmlToMarkdown(assistantNode.innerHTML);
+  if (convertedFallback && convertedFallback.length >= 50) {
+    return convertedFallback;
   }
 
   throw new Error('Native Copy button extraction failed: Could not read content from clipboard after multiple attempts.');
@@ -352,23 +369,37 @@ async function copyWritingBlockContent(header, editor, maxRetries = 40) {
     if (btn) {
       try {
         console.log(`[AutoAgent] Clicking Canvas copy button (attempt ${attempt})...`);
+        window.focus();
+        btn.focus();
         btn.click();
 
         // Clipboard write delay
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, 450));
 
         const text = await navigator.clipboard.readText();
         if (text && text.trim().length >= 20) {
           return text.trim();
         }
       } catch (err) {
-        console.warn(`[AutoAgent] Canvas copy button clipboard read attempt ${attempt} failed:`, err.message);
+        console.warn(`[AutoAgent] Canvas copy button clipboard read attempt ${attempt} failed: ${err.message}`);
+        if (err.message && err.message.includes('Document is not focused')) {
+          console.log('[AutoAgent] Tab unfocused for Canvas clipboard API. Extracting structured Markdown from editor HTML...');
+          const converted = htmlToMarkdown(editor.innerHTML);
+          if (converted && converted.length >= 20) {
+            return converted;
+          }
+        }
       }
     } else {
       console.log(`[AutoAgent] Waiting for Canvas copy button to appear (attempt ${attempt}/${maxRetries})...`);
     }
 
     await new Promise(r => setTimeout(r, 600));
+  }
+
+  const convertedFallback = htmlToMarkdown(editor.innerHTML);
+  if (convertedFallback && convertedFallback.length >= 20) {
+    return convertedFallback;
   }
 
   throw new Error('Native Canvas Copy button extraction failed: Could not read content from clipboard after multiple attempts.');

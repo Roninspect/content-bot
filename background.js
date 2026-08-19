@@ -1164,6 +1164,10 @@ async function processPinterestKeyword(currentItem, itemIndex, totalCount, worke
 
       if (state.status !== 'RUNNING') break;
 
+      try {
+        await chrome.tabs.update(tab.id, { active: true });
+      } catch (e) {}
+
       const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
       if (extractResult.status !== 'success') {
         throw new Error(`Extraction failed: ${extractResult.message}`);
@@ -1303,11 +1307,15 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
 
     if (state.status !== 'RUNNING') return;
 
+    try {
+      await chrome.tabs.update(tab.id, { active: true });
+    } catch (e) {}
+
     const extractResult = await sendMessageToTab(tab.id, { action: 'extractContent' });
     if (extractResult.status !== 'success') {
       throw new Error(`Extraction failed: ${extractResult.message}`);
     }
-
+ 
     const articleHtml = extractResult.content;
     const articleMarkdown = extractResult.markdown;
     
@@ -1369,6 +1377,10 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
         throw new Error(`Custom GPT generation failed: ${pollErr.message}`);
       }
 
+      try {
+        await chrome.tabs.update(gptTab.id, { active: true });
+      } catch (e) {}
+
       const extractResult = await sendMessageToTab(gptTab.id, { action: 'waitForGptIntro' });
       if (extractResult.status !== 'success') {
         throw new Error(`Custom GPT extraction failed: ${extractResult.message}`);
@@ -1427,6 +1439,10 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
       } catch (pollErr) {
         throw new Error(`Listicle GPT generation failed: ${pollErr.message}`);
       }
+
+      try {
+        await chrome.tabs.update(listicleTab.id, { active: true });
+      } catch (e) {}
 
       const extractResult = await sendMessageToTab(listicleTab.id, { action: 'waitForGptIntro' });
       if (extractResult.status !== 'success') {
