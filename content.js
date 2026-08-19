@@ -172,41 +172,40 @@ function getWritingBlockContentContainer() {
       || container.querySelector('[class*="editor"]');
 }
 
-// Extracts plain text from inline message bubbles by clicking the message copy button
-async function copyStandardAssistantContent(assistantNode) {
-  const btn = assistantNode.querySelector('button[aria-label="Copy"][data-state]')
-           || assistantNode.querySelector('button[aria-label="Copy"]')
-           || assistantNode.querySelector('button[data-testid="copy-button"]')
-           || Array.from(assistantNode.querySelectorAll('button')).find(b => {
-                const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                return label.includes('copy');
-              });
+// Extracts plain text from inline message bubbles strictly by clicking the message copy button
+async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const btn = assistantNode.querySelector('button[aria-label="Copy"][data-state]')
+             || assistantNode.querySelector('button[aria-label="Copy"]')
+             || assistantNode.querySelector('button[data-testid="copy-button"]')
+             || Array.from(assistantNode.querySelectorAll('button')).find(b => {
+                  const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                  return label.includes('copy');
+                });
 
-  if (!btn) {
-    console.log('[AutoAgent] Standard copy button not found inside chat bubble. Falling back to innerText.');
-    return assistantNode.innerText.trim();
+    if (btn) {
+      try {
+        console.log(`[AutoAgent] Clicking standard copy button (attempt ${attempt})...`);
+        btn.click();
+
+        // Clipboard write delay
+        await new Promise(r => setTimeout(r, 400));
+
+        const text = await navigator.clipboard.readText();
+        if (text && text.trim().length >= 20) {
+          return text.trim();
+        }
+      } catch (err) {
+        console.warn(`[AutoAgent] Copy button clipboard read attempt ${attempt} failed:`, err.message);
+      }
+    } else {
+      console.log(`[AutoAgent] Waiting for copy button to appear (attempt ${attempt}/${maxRetries})...`);
+    }
+
+    await new Promise(r => setTimeout(r, 600));
   }
 
-  try {
-    console.log('[AutoAgent] Clicking standard copy button...');
-    btn.click();
-
-    // Clipboard write delay
-    await new Promise(r => setTimeout(r, 300));
-
-    const text = await navigator.clipboard.readText();
-    if (text && text.trim().length >= 20) {
-      return text.trim();
-    }
-    throw new Error('Clipboard content empty or too short');
-  } catch (err) {
-    console.warn('[AutoAgent] Standard copy button clipboard read failed, using innerText:', err.message);
-    const fallbackText = assistantNode.innerText.trim();
-    if (fallbackText.length < 20) {
-      throw new Error('Both standard clipboard copy and innerText fallback returned empty content');
-    }
-    return fallbackText;
-  }
+  throw new Error('Native Copy button extraction failed: Could not read content from clipboard after multiple attempts.');
 }
 
 // Debounced writing block observer with parallel poller timer and 3s inline bubble fallback
@@ -281,35 +280,34 @@ function waitForWritingBlock(onReady, onFallbackInline, onError, timeoutMs = 600
   check();
 }
 
-// Simulated copy click and clipboard extraction with innerText fallback
-async function copyWritingBlockContent(header, editor) {
-  const btn = getWritingBlockCopyButton();
-           
-  if (!btn) {
-    console.log('[AutoAgent] Canvas copy button not found inside header. Falling back to innerText.');
-    return editor.innerText.trim();
+// Simulated copy click and clipboard extraction (strictly via native Canvas Copy button)
+async function copyWritingBlockContent(header, editor, maxRetries = 40) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const btn = getWritingBlockCopyButton();
+             
+    if (btn) {
+      try {
+        console.log(`[AutoAgent] Clicking Canvas copy button (attempt ${attempt})...`);
+        btn.click();
+
+        // Clipboard write delay
+        await new Promise(r => setTimeout(r, 400));
+
+        const text = await navigator.clipboard.readText();
+        if (text && text.trim().length >= 20) {
+          return text.trim();
+        }
+      } catch (err) {
+        console.warn(`[AutoAgent] Canvas copy button clipboard read attempt ${attempt} failed:`, err.message);
+      }
+    } else {
+      console.log(`[AutoAgent] Waiting for Canvas copy button to appear (attempt ${attempt}/${maxRetries})...`);
+    }
+
+    await new Promise(r => setTimeout(r, 600));
   }
 
-  try {
-    console.log('[AutoAgent] Clicking Canvas copy button...');
-    btn.click();
-
-    // Clipboard write delay
-    await new Promise(r => setTimeout(r, 300));
-
-    const text = await navigator.clipboard.readText();
-    if (text && text.trim().length >= 20) {
-      return text.trim();
-    }
-    throw new Error('Clipboard content empty or too short');
-  } catch (err) {
-    console.warn('[AutoAgent] Clipboard extraction failed, falling back to innerText:', err.message);
-    const fallbackText = editor.innerText.trim();
-    if (fallbackText.length < 20) {
-      throw new Error('Both clipboard and innerText fallback returned empty content');
-    }
-    return fallbackText;
-  }
+  throw new Error('Native Canvas Copy button extraction failed: Could not read content from clipboard after multiple attempts.');
 }
 
 // Consolidates wait and extraction for Custom GPT intro rewrites
@@ -764,17 +762,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .then(markdown => {
           sendResponse({ 
             status: 'success', 
-            content: container.innerHTML, 
+            content: '', 
             markdown: markdown 
           });
         })
         .catch(err => {
-          // Fallback to innerText if clipboard read fails
-          console.warn('[AutoAgent] Clipboard copy failed during extraction, using innerText:', err.message);
+          console.error('[AutoAgent] Native copy extraction failed:', err.message);
           sendResponse({ 
-            status: 'success', 
-            content: container.innerHTML, 
-            markdown: container.innerText || '' 
+            status: 'error', 
+            message: `Native copy extraction failed: ${err.message}` 
           });
         });
     } else {
