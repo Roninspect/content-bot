@@ -80,17 +80,27 @@ function findSendButton() {
 // Fallback chain selector for stop button
 function findStopButton() {
   if (isGrok) {
-    return document.querySelector('button[aria-label="Stop model response"]');
+    const stopBtn = document.querySelector('button[aria-label*="Stop" i]')
+                 || document.querySelector('button[aria-label*="Cancel" i]')
+                 || document.querySelector('button[data-testid*="stop" i]');
+    if (stopBtn) return stopBtn;
+
+    // Check if the submit button is in stop/generating mode
+    const submitBtn = document.querySelector('button[data-testid="chat-submit"]') || document.querySelector('button[aria-label="Submit"]');
+    if (submitBtn) {
+      if (submitBtn.querySelector('rect') || (submitBtn.getAttribute('aria-label') || '').toLowerCase().includes('stop')) {
+        return submitBtn;
+      }
+    }
+    return null;
   } else {
     // ChatGPT Selectors
     const stopBtn = document.querySelector('button[data-testid="stop-button"]')
                  || document.querySelector('button[aria-label="Stop answering"]')
                  || document.querySelector('button[aria-label*="stop" i]')
-                 || document.querySelector('button[aria-label*="Stop" i]')
                  || document.querySelector('button[aria-label="Stop generating"]')
                  || document.querySelector('button[aria-label="Stop"]')
-                 || document.querySelector('#composer-submit-button')
-                 || document.querySelector('button[data-testid="send-button"]');
+                 || document.querySelector('#composer-submit-button');
 
     if (stopBtn) {
       const label = (stopBtn.getAttribute('aria-label') || '').toLowerCase();
@@ -101,6 +111,23 @@ function findStopButton() {
     }
     return null;
   }
+}
+
+// Dedicated helper to locate genuine Copy button inside or adjacent to response bubble
+function findCopyButton(container) {
+  if (!container) return null;
+  const parentMessage = container.closest('[class*="message"], [data-testid*="message"]') || container.parentElement || container;
+  
+  const btn = parentMessage.querySelector('button[aria-label="Copy" i]')
+           || parentMessage.querySelector('button[aria-label*="Copy" i]')
+           || parentMessage.querySelector('button[data-testid*="copy" i]')
+           || Array.from(parentMessage.querySelectorAll('button')).find(b => {
+                const label = (b.getAttribute('aria-label') || '').toLowerCase();
+                const testId = (b.getAttribute('data-testid') || '').toLowerCase();
+                const title = (b.getAttribute('title') || '').toLowerCase();
+                return (label.includes('copy') || testId.includes('copy') || title.includes('copy')) && !label.includes('code');
+              });
+  return btn || null;
 }
 
 // Locate the last assistant response container (for standard chats)
@@ -151,10 +178,9 @@ function getWritingBlockCopyButton() {
               || container.querySelector('div[class*="flex"]');
   if (!header) return null;
   
-  return header.querySelector('button[aria-label="Copy"][data-state]')
-      || header.querySelector('button[aria-label="Copy"]')
+  return header.querySelector('button[aria-label="Copy" i]')
       || header.querySelector('button[aria-label*="Copy" i]')
-      || header.querySelector('button[data-testid*="copy"]');
+      || header.querySelector('button[data-testid*="copy" i]');
 }
 
 // Locate ChatGPT Writing Block editor content container
@@ -175,13 +201,7 @@ function getWritingBlockContentContainer() {
 // Extracts plain text from inline message bubbles strictly by clicking the message copy button
 async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const btn = assistantNode.querySelector('button[aria-label="Copy"][data-state]')
-             || assistantNode.querySelector('button[aria-label="Copy"]')
-             || assistantNode.querySelector('button[data-testid="copy-button"]')
-             || Array.from(assistantNode.querySelectorAll('button')).find(b => {
-                  const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                  return label.includes('copy');
-                });
+    const btn = findCopyButton(assistantNode);
 
     if (btn) {
       try {
@@ -396,7 +416,7 @@ function isGenerationDone() {
   const currentLen = currentText.trim().length;
 
   // Track text growth & changes
-  if (Math.abs(currentLen - streamStabilityTracker.lastLength) > 5) {
+  if (Math.abs(currentLen - streamStabilityTracker.lastLength) > 10) {
     streamStabilityTracker.lastLength = currentLen;
     streamStabilityTracker.lastChangeTime = Date.now();
     streamStabilityTracker.stableCycles = 0;
@@ -404,37 +424,32 @@ function isGenerationDone() {
     streamStabilityTracker.stableCycles++;
   }
 
-  // Guard: Must have passed at least 4 seconds since prompt submission
+  // Initial buffer: Must have passed at least 6 seconds since prompt submission
   const elapsedSincePrompt = Date.now() - (streamStabilityTracker.promptStartTime || 0);
-  if (streamStabilityTracker.promptStartTime > 0 && elapsedSincePrompt < 4000) {
+  if (streamStabilityTracker.promptStartTime > 0 && elapsedSincePrompt < 6000) {
     return { done: false };
   }
 
-  // Check buttons
-  const sendBtn = findSendButton();
-  const stopBtn = findStopButton();
-  const copyBtn = container.querySelector('button[aria-label="Copy"]')
-               || container.querySelector('button[data-state]')
-               || Array.from(container.querySelectorAll('button')).find(b => {
-                    const label = (b.getAttribute('aria-label') || '').toLowerCase();
-                    return label.includes('copy');
-                  });
-
-  // Text is stable if length hasn't significantly changed for at least 2 cycles (>= 4s) and has meaningful content
-  const isTextStable = streamStabilityTracker.stableCycles >= 2 && currentLen > 50;
-
   // If stop button is visible, it is definitely still generating
+  const stopBtn = findStopButton();
   if (stopBtn) {
     return { done: false };
   }
 
-  // If text is stable and either copy button is present or send button is idle
-  if (isTextStable && (copyBtn || (sendBtn && !sendBtn.disabled))) {
+  // Look strictly for genuine Copy button
+  const copyBtn = findCopyButton(container);
+
+  // Text must be stable for at least 3 consecutive polling cycles (>= 6 seconds unchanged) and have meaningful content
+  const isTextStable = streamStabilityTracker.stableCycles >= 3 && currentLen > 50;
+
+  // Primary completion rule: A genuine Copy button is present AND text has stayed stable for at least 2 cycles (4s)
+  if (copyBtn && streamStabilityTracker.stableCycles >= 2 && currentLen > 50) {
     return { done: true };
   }
 
-  // If copy button is present and text has stayed stable for at least 1 cycle
-  if (copyBtn && streamStabilityTracker.stableCycles >= 1 && currentLen > 50) {
+  // Secondary fallback: Send button is active and text has been completely stable for at least 4 cycles (8s)
+  const sendBtn = findSendButton();
+  if (isTextStable && streamStabilityTracker.stableCycles >= 4 && sendBtn && !sendBtn.disabled) {
     return { done: true };
   }
 
