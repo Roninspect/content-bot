@@ -115,25 +115,34 @@ function findStopButton() {
 
 // Dedicated helper to locate genuine Message-level Copy button (excluding code block copy buttons)
 function findCopyButton(container) {
+  // 1. Direct Grok "Copy response" button check (highest accuracy)
+  if (isGrok) {
+    const directGrokBtn = document.querySelector('.last-response button[aria-label*="Copy response" i]')
+                       || document.querySelector('button[aria-label="Copy response" i]')
+                       || document.querySelector('button[aria-label*="Copy response" i]');
+    if (directGrokBtn) return directGrokBtn;
+  }
+
   if (!container) return null;
   const parentMessage = container.closest('[data-testid*="message"], [class*="message-row"], [class*="response"], [class*="chat-message"]') 
                      || container.closest('[class*="message"]') 
                      || container.parentElement 
                      || container;
 
-  // 1. Look in message action bars / footers (bottom of message)
+  // 2. Look in message action bars / footers (bottom of message)
   const actionBars = parentMessage.querySelectorAll('[class*="action"], [class*="toolbar"], [class*="footer"], [class*="bottom"]');
   for (const bar of Array.from(actionBars).reverse()) {
     if (bar.closest('pre, code, [class*="code"], [class*="syntax"]')) continue;
 
-    const copyBtn = bar.querySelector('button[aria-label="Copy" i]')
+    const copyBtn = bar.querySelector('button[aria-label*="Copy response" i]')
+                 || bar.querySelector('button[aria-label="Copy" i]')
                  || bar.querySelector('button[aria-label*="Copy" i]')
                  || bar.querySelector('button[data-testid*="copy" i]')
                  || bar.querySelector('button[title*="Copy" i]');
     if (copyBtn) return copyBtn;
   }
 
-  // 2. Search all buttons inside message excluding code block containers
+  // 3. Search all buttons inside message excluding code block containers
   const allButtons = Array.from(parentMessage.querySelectorAll('button')).filter(b => {
     return !b.closest('pre, code, [class*="code"], [class*="syntax"]');
   });
@@ -147,7 +156,7 @@ function findCopyButton(container) {
 
   if (messageCopyBtn) return messageCopyBtn;
 
-  // 3. Fallback: Search the document for the last non-code copy button
+  // 4. Fallback: Search the document for the last non-code copy button
   if (isGrok) {
     const grokButtons = Array.from(document.querySelectorAll('button')).filter(b => {
       if (b.closest('pre, code, [class*="code"]')) return false;
