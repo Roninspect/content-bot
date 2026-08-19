@@ -1310,8 +1310,14 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
 
     const articleHtml = extractResult.content;
     const articleMarkdown = extractResult.markdown;
+    
+    const grokWordCount = articleMarkdown.split(/\s+/).filter(Boolean).length;
+    if (grokWordCount < (settings.testMode ? 30 : 250)) {
+      throw new Error(`Grok generated article was too short or incomplete (${grokWordCount} words). Expected at least 250 words.`);
+    }
+
     const grokPreview = articleMarkdown.split('\n').filter(l => l.trim()).slice(0, 5).join('\n');
-    addLog('success', `${tag} Scraped Grok Article Preview:\n${grokPreview}`);
+    addLog('success', `${tag} Scraped Grok Article (${grokWordCount} words):\n${grokPreview}`);
     broadcastState();
 
     parsedMd = parseGrokOutput(articleMarkdown);
@@ -1323,7 +1329,7 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
     }
 
     finalMarkdown = `${parsedMd.intro}\n\n${parsedMd.body}`.trim();
-    finalHtml = `${parsedHtml.intro}\n\n${parsedHtml.body}`.trim();
+    finalHtml = markdownToHtml(finalMarkdown);
 
   } finally {
     cleanupTab(tab.id);
@@ -1380,7 +1386,7 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
       }
 
       finalMarkdown = `${newIntroMarkdown}\n\n${parsedMd.body}`.trim();
-      finalHtml = `${newIntroHtml}\n\n${parsedHtml.body}`.trim();
+      finalHtml = markdownToHtml(finalMarkdown);
 
     } finally {
       cleanupTab(gptTab.id);
@@ -1439,11 +1445,10 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
 
       if (settings.gptRewrite && settings.customGptUrl) {
         finalMarkdown = `${newIntroMarkdown}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
-        finalHtml = `${newIntroHtml}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
       } else {
         finalMarkdown = `${parsedMd.intro}\n\n${listicleSectionMarkdown}\n\n${parsedMd.body}`.trim();
-        finalHtml = `${parsedHtml.intro}\n\n${listicleSectionHtml}\n\n${parsedHtml.body}`.trim();
       }
+      finalHtml = markdownToHtml(finalMarkdown);
 
     } finally {
       cleanupTab(listicleTab.id);

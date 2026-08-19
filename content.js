@@ -371,6 +371,21 @@ function checkBlockStatus() {
   return null;
 }
 
+// State trackers for stream stability across polling checks
+let streamStabilityTracker = {
+  lastLength: 0,
+  lastChangeTime: Date.now(),
+  stableCycles: 0,
+  promptStartTime: 0
+};
+
+let gptIntroStabilityTracker = {
+  lastLength: 0,
+  lastChangeTime: Date.now(),
+  stableCycles: 0,
+  promptStartTime: 0
+};
+
 // Synchronously check if standard generation is complete
 function isGenerationDone() {
   const block = checkBlockStatus();
@@ -379,7 +394,27 @@ function isGenerationDone() {
   const container = findLastAssistantResponse();
   if (!container) return { done: false };
 
-  // 1. Check if copy button is present
+  const currentText = container.innerText || '';
+  const currentLen = currentText.trim().length;
+
+  // Track text growth & changes
+  if (Math.abs(currentLen - streamStabilityTracker.lastLength) > 5) {
+    streamStabilityTracker.lastLength = currentLen;
+    streamStabilityTracker.lastChangeTime = Date.now();
+    streamStabilityTracker.stableCycles = 0;
+  } else if (currentLen > 30) {
+    streamStabilityTracker.stableCycles++;
+  }
+
+  // Guard: Must have passed at least 4 seconds since prompt submission
+  const elapsedSincePrompt = Date.now() - (streamStabilityTracker.promptStartTime || 0);
+  if (streamStabilityTracker.promptStartTime > 0 && elapsedSincePrompt < 4000) {
+    return { done: false };
+  }
+
+  // Check buttons
+  const sendBtn = findSendButton();
+  const stopBtn = findStopButton();
   const copyBtn = container.querySelector('button[aria-label="Copy"]')
                || container.querySelector('button[data-state]')
                || Array.from(container.querySelectorAll('button')).find(b => {
@@ -387,15 +422,21 @@ function isGenerationDone() {
                     return label.includes('copy');
                   });
 
-  if (copyBtn) {
+  // Text is stable if length hasn't significantly changed for at least 2 cycles (>= 4s) and has meaningful content
+  const isTextStable = streamStabilityTracker.stableCycles >= 2 && currentLen > 50;
+
+  // If stop button is visible, it is definitely still generating
+  if (stopBtn) {
+    return { done: false };
+  }
+
+  // If text is stable and either copy button is present or send button is idle
+  if (isTextStable && (copyBtn || (sendBtn && !sendBtn.disabled))) {
     return { done: true };
   }
 
-  // 2. Check if stop button is absent and send button is active
-  const sendBtn = findSendButton();
-  const stopBtn = findStopButton();
-
-  if (!stopBtn && sendBtn && !sendBtn.disabled) {
+  // If copy button is present and text has stayed stable for at least 1 cycle
+  if (copyBtn && streamStabilityTracker.stableCycles >= 1 && currentLen > 50) {
     return { done: true };
   }
 
@@ -412,9 +453,28 @@ function isGptIntroDone() {
 
   // If Canvas (Writing block) is active
   if (editor && copyBtn) {
-    const sendBtn = findSendButton();
+    const currentText = editor.innerText || '';
+    const currentLen = currentText.trim().length;
+
+    if (Math.abs(currentLen - gptIntroStabilityTracker.lastLength) > 5) {
+      gptIntroStabilityTracker.lastLength = currentLen;
+      gptIntroStabilityTracker.lastChangeTime = Date.now();
+      gptIntroStabilityTracker.stableCycles = 0;
+    } else if (currentLen > 30) {
+      gptIntroStabilityTracker.stableCycles++;
+    }
+
+    const elapsed = Date.now() - (gptIntroStabilityTracker.promptStartTime || 0);
+    if (gptIntroStabilityTracker.promptStartTime > 0 && elapsed < 4000) {
+      return { done: false };
+    }
+
     const stopBtn = findStopButton();
-    if (sendBtn && !sendBtn.disabled && !stopBtn) {
+    const sendBtn = findSendButton();
+
+    if (stopBtn) return { done: false };
+
+    if (gptIntroStabilityTracker.stableCycles >= 2 && currentLen > 50) {
       return { done: true };
     }
     return { done: false };
@@ -424,9 +484,28 @@ function isGptIntroDone() {
   const assistants = document.querySelectorAll('div[data-message-author-role="assistant"]');
   if (assistants.length > 0) {
     const lastAssistant = assistants[assistants.length - 1];
-    const sendBtn = findSendButton();
+    const currentText = lastAssistant.innerText || '';
+    const currentLen = currentText.trim().length;
+
+    if (Math.abs(currentLen - gptIntroStabilityTracker.lastLength) > 5) {
+      gptIntroStabilityTracker.lastLength = currentLen;
+      gptIntroStabilityTracker.lastChangeTime = Date.now();
+      gptIntroStabilityTracker.stableCycles = 0;
+    } else if (currentLen > 30) {
+      gptIntroStabilityTracker.stableCycles++;
+    }
+
+    const elapsed = Date.now() - (gptIntroStabilityTracker.promptStartTime || 0);
+    if (gptIntroStabilityTracker.promptStartTime > 0 && elapsed < 4000) {
+      return { done: false };
+    }
+
     const stopBtn = findStopButton();
-    if (sendBtn && !sendBtn.disabled && !stopBtn) {
+    const sendBtn = findSendButton();
+
+    if (stopBtn) return { done: false };
+
+    if (gptIntroStabilityTracker.stableCycles >= 2 && currentLen > 50) {
       return { done: true };
     }
   }
@@ -497,6 +576,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'enterPrompt') {
+    streamStabilityTracker = {
+      lastLength: 0,
+      lastChangeTime: Date.now(),
+      stableCycles: 0,
+      promptStartTime: Date.now()
+    };
+    gptIntroStabilityTracker = {
+      lastLength: 0,
+      lastChangeTime: Date.now(),
+      stableCycles: 0,
+      promptStartTime: Date.now()
+    };
+
     let inputEl = findInputBox();
     let retries = 0;
 
