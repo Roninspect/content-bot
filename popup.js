@@ -231,9 +231,157 @@ Output strictly in this JSON format, with no extra text before or after:
   "description": "Some description"
 }`;
 
-  const DEFAULT_BOOK_PROMPT = `Write a comprehensive, engaging book chapter/guide about {keyword}.
-Structure the text into logical sections with clear descriptive titles on their own lines.
-Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Write in clean, formatted plain text with standard paragraphs.`;
+  const DEFAULT_BOOK_PROMPT = `KEYWORD: {{KEYWORD}}
+
+You are an expert book journalist, SEO strategist and fact-checker.
+
+Research and write a complete, original, SEO-friendly book article based only on the supplied keyword. Do not ask me for additional information. Infer the search intent, audience, article type, suitable title, number of books, headings, related keywords and appropriate length.
+
+RESEARCH
+
+- Research before writing.
+- Verify book facts using official author pages, publishers, Open Library or Google Books.
+- Analyze reputable book blogs and relevant Reddit discussions to understand reader opinions, recurring recommendations, complaints, tropes and questions.
+- Use blogs and Reddit for insight only. Never copy their wording, ordering or article structure.
+- Paraphrase community opinions without usernames.
+- Never invent titles, authors, ISBNs, publication details, series order, tropes or content warnings.
+- Return null when an ISBN or other detail cannot be verified.
+- Never claim you personally read a book.
+- Keep all descriptions spoiler-free.
+- Do not include changing Goodreads ratings.
+
+SEARCH INTENT
+
+- Determine whether the keyword requires a listicle, individual review, comparison, reading-order guide, upcoming-release article or another format.
+- If the keyword contains a number, use that exact number.
+- Otherwise, select an appropriate number based on research and available high-quality recommendations, normally 8–15.
+- Include only books that closely satisfy the keyword.
+
+SEO
+
+- Create a natural H1 title containing the primary keyword.
+- Generate a 50–60 character SEO title.
+- Generate a 145–160 character meta description.
+- Generate a clean lowercase slug.
+- Generate a 25–35 word excerpt.
+- Identify related secondary keywords automatically.
+- Use one H1 only.
+- Use H2 for major sections and H3 for individual book titles and FAQ questions.
+- Use short paragraphs of 2–4 sentences.
+- Avoid keyword stuffing.
+- Include 3–5 useful FAQ questions based on actual search and community research.
+- Suggest relevant internal-link opportunities.
+- Write enough content to satisfy the query completely without padding.
+
+BOOK SECTIONS
+
+For every recommended book provide:
+
+- Exact title
+- Exact author
+- Series and series position when verified
+- Verified ISBN-13 when available
+- Open Library lookup query
+- Approximately 120–180 words of original, spoiler-free commentary
+- Premise
+- Fantasy elements
+- Romance style or important tropes
+- Tone
+- Ideal reader
+- Relevant content notes only when verified
+- Goodreads search query
+- Amazon search query
+- Research source URLs
+
+Each Ronin Book section must follow this vertical order:
+
+1. Large centered book cover
+2. H3 book title
+3. Author
+4. Description
+5. Goodreads and Amazon buttons in one row
+
+Never add labels such as “Book 1,” “Book 2,” “Featured Book” or “Recommendation 1.”
+
+WRITING QUALITY
+
+- Write in a knowledgeable, natural and direct editorial voice.
+- Provide original analysis instead of rewriting publisher descriptions.
+- Explain why every book belongs in the article.
+- Mention meaningful differences between recommendations.
+- Include reasonable reader-fit limitations where useful.
+- Avoid spoilers, filler and exaggerated claims.
+- Avoid phrases such as “delve into,” “embark on,” “ultimate guide,” “without further ado” and “whether you’re a seasoned reader.”
+- Do not copy sentences from any source.
+
+OUTPUT
+
+Return valid JSON only, without Markdown fences or additional commentary:
+
+{
+  "title": "",
+  "seo_title": "",
+  "slug": "",
+  "meta_description": "",
+  "excerpt": "",
+  "primary_keyword": "",
+  "secondary_keywords": [],
+  "category": "Book Reviews",
+  "affiliate_disclosure": "",
+  "introduction": ["", ""],
+  "topic_explanation": {
+    "heading": "",
+    "paragraphs": ["", ""]
+  },
+  "recommendations_heading": "",
+  "books": [
+    {
+      "title": "",
+      "author": "",
+      "series": null,
+      "series_position": null,
+      "isbn13": null,
+      "open_library_query": "",
+      "description": ["", ""],
+      "tropes": [],
+      "fantasy_elements": [],
+      "romance_style": "",
+      "tone": "",
+      "ideal_reader": "",
+      "content_notes": null,
+      "goodreads_query": "",
+      "amazon_query": "",
+      "research_source_urls": []
+    }
+  ],
+  "selection_help": {
+    "heading": "",
+    "paragraphs": ["", ""]
+  },
+  "faq": [
+    {
+      "question": "",
+      "answer": ""
+    }
+  ],
+  "conclusion": [""],
+  "internal_link_suggestions": [
+    {
+      "anchor_text": "",
+      "target_topic": ""
+    }
+  ],
+  "sources": [
+    {
+      "source_name": "",
+      "source_url": "",
+      "source_type": "official|publisher|book_database|blog|reddit",
+      "used_for": ""
+    }
+  ]
+}
+
+Before returning the result, verify that all facts are supported, the JSON is valid, the article matches the keyword’s intent, no required books are missing and no source language has been copied.`;
 
   let cachedArticlePrompt = DEFAULT_PROMPT;
   let cachedPinterestPrompt = DEFAULT_PINTEREST_PROMPT;

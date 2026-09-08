@@ -104,6 +104,158 @@ function getTodayStr() {
 const HARDCODED_SB_URL = 'https://wgsqlctbgflkfnjkcubb.supabase.co';
 const HARDCODED_SB_KEY = 'sb_publishable_Qz9vTBAZcjaLYAJYPbDAHA_jFOMGnJG';
 
+const DEFAULT_BOOK_PROMPT = `KEYWORD: {{KEYWORD}}
+
+You are an expert book journalist, SEO strategist and fact-checker.
+
+Research and write a complete, original, SEO-friendly book article based only on the supplied keyword. Do not ask me for additional information. Infer the search intent, audience, article type, suitable title, number of books, headings, related keywords and appropriate length.
+
+RESEARCH
+
+- Research before writing.
+- Verify book facts using official author pages, publishers, Open Library or Google Books.
+- Analyze reputable book blogs and relevant Reddit discussions to understand reader opinions, recurring recommendations, complaints, tropes and questions.
+- Use blogs and Reddit for insight only. Never copy their wording, ordering or article structure.
+- Paraphrase community opinions without usernames.
+- Never invent titles, authors, ISBNs, publication details, series order, tropes or content warnings.
+- Return null when an ISBN or other detail cannot be verified.
+- Never claim you personally read a book.
+- Keep all descriptions spoiler-free.
+- Do not include changing Goodreads ratings.
+
+SEARCH INTENT
+
+- Determine whether the keyword requires a listicle, individual review, comparison, reading-order guide, upcoming-release article or another format.
+- If the keyword contains a number, use that exact number.
+- Otherwise, select an appropriate number based on research and available high-quality recommendations, normally 8–15.
+- Include only books that closely satisfy the keyword.
+
+SEO
+
+- Create a natural H1 title containing the primary keyword.
+- Generate a 50–60 character SEO title.
+- Generate a 145–160 character meta description.
+- Generate a clean lowercase slug.
+- Generate a 25–35 word excerpt.
+- Identify related secondary keywords automatically.
+- Use one H1 only.
+- Use H2 for major sections and H3 for individual book titles and FAQ questions.
+- Use short paragraphs of 2–4 sentences.
+- Avoid keyword stuffing.
+- Include 3–5 useful FAQ questions based on actual search and community research.
+- Suggest relevant internal-link opportunities.
+- Write enough content to satisfy the query completely without padding.
+
+BOOK SECTIONS
+
+For every recommended book provide:
+
+- Exact title
+- Exact author
+- Series and series position when verified
+- Verified ISBN-13 when available
+- Open Library lookup query
+- Approximately 120–180 words of original, spoiler-free commentary
+- Premise
+- Fantasy elements
+- Romance style or important tropes
+- Tone
+- Ideal reader
+- Relevant content notes only when verified
+- Goodreads search query
+- Amazon search query
+- Research source URLs
+
+Each Ronin Book section must follow this vertical order:
+
+1. Large centered book cover
+2. H3 book title
+3. Author
+4. Description
+5. Goodreads and Amazon buttons in one row
+
+Never add labels such as “Book 1,” “Book 2,” “Featured Book” or “Recommendation 1.”
+
+WRITING QUALITY
+
+- Write in a knowledgeable, natural and direct editorial voice.
+- Provide original analysis instead of rewriting publisher descriptions.
+- Explain why every book belongs in the article.
+- Mention meaningful differences between recommendations.
+- Include reasonable reader-fit limitations where useful.
+- Avoid spoilers, filler and exaggerated claims.
+- Avoid phrases such as “delve into,” “embark on,” “ultimate guide,” “without further ado” and “whether you’re a seasoned reader.”
+- Do not copy sentences from any source.
+
+OUTPUT
+
+Return valid JSON only, without Markdown fences or additional commentary:
+
+{
+  "title": "",
+  "seo_title": "",
+  "slug": "",
+  "meta_description": "",
+  "excerpt": "",
+  "primary_keyword": "",
+  "secondary_keywords": [],
+  "category": "Book Reviews",
+  "affiliate_disclosure": "",
+  "introduction": ["", ""],
+  "topic_explanation": {
+    "heading": "",
+    "paragraphs": ["", ""]
+  },
+  "recommendations_heading": "",
+  "books": [
+    {
+      "title": "",
+      "author": "",
+      "series": null,
+      "series_position": null,
+      "isbn13": null,
+      "open_library_query": "",
+      "description": ["", ""],
+      "tropes": [],
+      "fantasy_elements": [],
+      "romance_style": "",
+      "tone": "",
+      "ideal_reader": "",
+      "content_notes": null,
+      "goodreads_query": "",
+      "amazon_query": "",
+      "research_source_urls": []
+    }
+  ],
+  "selection_help": {
+    "heading": "",
+    "paragraphs": ["", ""]
+  },
+  "faq": [
+    {
+      "question": "",
+      "answer": ""
+    }
+  ],
+  "conclusion": [""],
+  "internal_link_suggestions": [
+    {
+      "anchor_text": "",
+      "target_topic": ""
+    }
+  ],
+  "sources": [
+    {
+      "source_name": "",
+      "source_url": "",
+      "source_type": "official|publisher|book_database|blog|reddit",
+      "used_for": ""
+    }
+  ]
+}
+
+Before returning the result, verify that all facts are supported, the JSON is valid, the article matches the keyword’s intent, no required books are missing and no source language has been copied.`;
+
 // Retrieve settings from local storage
 function getSettings() {
   return new Promise((resolve) => {
@@ -153,9 +305,7 @@ Output strictly in this JSON format, with no extra text before or after:
   "title": "Some title",
   "description": "Some description"
 }`,
-        bookPromptTemplate: items.bookPromptTemplate || `Write a comprehensive, engaging book chapter/guide about {keyword}.
-Structure the text into logical sections with clear descriptive titles on their own lines.
-Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Write in clean, formatted plain text with standard paragraphs.`,
+        bookPromptTemplate: items.bookPromptTemplate || DEFAULT_BOOK_PROMPT,
         testMode: items.testMode || false,
         schedStartDate: items.schedStartDate || getTodayStr(),
         schedPostsPerDay: parseInt(items.schedPostsPerDay) || 3,
@@ -494,6 +644,37 @@ function flattenMarkdownToPlainText(md) {
   text = text.replace(/\n{3,}/g, '\n\n');
 
   return text.trim();
+}
+
+// Extract and parse book article JSON from Grok response
+function extractBookJson(rawText) {
+  let text = (rawText || '').trim();
+
+  // Strip Markdown code fences if Grok wrapped the JSON in ```json ... ``` or ``` ... ```
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenceMatch) {
+    text = fenceMatch[1].trim();
+  } else {
+    // If there is preamble or postscript, isolate from first { to last }
+    const firstBrace = text.indexOf('{');
+    const lastBrace = text.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      text = text.substring(firstBrace, lastBrace + 1);
+    }
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    // Attempt relaxed cleanup for trailing commas before } or ]
+    try {
+      const sanitized = text.replace(/,\s*([\]}])/g, '$1');
+      return JSON.parse(sanitized);
+    } catch (e) {
+      const snippet = text.length > 200 ? text.substring(0, 200) + '...' : text;
+      throw new Error(`Failed to parse book article JSON from Grok (${err.message}). Raw snippet: "${snippet}"`);
+    }
+  }
 }
 
 function validateWordPressFormatting(markdown, html) {
@@ -1874,7 +2055,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
   const tab = await createTab('https://grok.com/');
 
   let finalTitle = currentItem.keyword;
-  let flattenedText = '';
+  let articleJson = null;
 
   try {
     addLog('info', `${tag} Waiting for Grok page to respond...`);
@@ -1884,9 +2065,11 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
       throw new Error('Grok page content script response timeout.');
     }
 
-    // Submit prompt
+    // Submit prompt with flexible keyword substitution ({{KEYWORD}}, {{keyword}}, or {keyword})
     const promptTpl = settings.bookPromptTemplate || settings.promptTemplate;
-    const formattedPrompt = promptTpl.replace(/{keyword}/gi, currentItem.keyword);
+    const formattedPrompt = promptTpl
+      .replace(/\{\{\s*keyword\s*\}\}/gi, currentItem.keyword)
+      .replace(/\{\s*keyword\s*\}/gi, currentItem.keyword);
 
     addLog('info', `${tag} Submitting book prompt to Grok...`);
     broadcastState();
@@ -1898,7 +2081,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
       throw new Error(`Failed to type/submit prompt: ${promptResult.message || 'unknown error'}`);
     }
 
-    addLog('info', `${tag} Book chapter streaming... waiting for completion.`);
+    addLog('info', `${tag} Book article streaming... waiting for completion.`);
     broadcastState();
 
     if (state.status !== 'RUNNING') return;
@@ -1909,7 +2092,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
       throw new Error(`Generation error: ${pollErr.message}`);
     }
 
-    addLog('info', `${tag} Generation complete. Scraping book content...`);
+    addLog('info', `${tag} Generation complete. Scraping book article JSON...`);
     broadcastState();
 
     if (state.status !== 'RUNNING') return;
@@ -1925,27 +2108,24 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
       throw extractionError;
     }
 
-    const rawMarkdown = extractResult.markdown;
-    const rawWordCount = rawMarkdown.split(/\s+/).filter(Boolean).length;
-    if (rawWordCount < (settings.testMode ? 30 : 250)) {
-      throw new Error(`Grok generated book chapter was too short or incomplete (${rawWordCount} words). Expected at least 250 words.`);
+    const rawOutput = extractResult.markdown || '';
+    if (!rawOutput.trim()) {
+      throw new Error('Grok returned an empty response.');
     }
 
-    // Extract title from output if present
-    const lines = rawMarkdown.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length > 0) {
-      const firstLine = lines[0].replace(/^#+\s*/, '').replace(/\*+/g, '').trim();
-      if (firstLine && firstLine.length <= 120) {
-        finalTitle = firstLine;
-      }
+    // Parse structured book article JSON directly
+    articleJson = extractBookJson(rawOutput);
+    if (!articleJson || typeof articleJson !== 'object') {
+      throw new Error('Grok generated output was not a valid JSON object.');
     }
 
-    // Compile into flattened plain text (no markdown syntax)
-    flattenedText = flattenMarkdownToPlainText(rawMarkdown);
-    const bookWordCount = flattenedText.split(/\s+/).filter(Boolean).length;
+    if (!articleJson.title && (!articleJson.books || articleJson.books.length === 0)) {
+      throw new Error('Grok book JSON is missing required fields (expected "title" or "books").');
+    }
 
-    const preview = flattenedText.split('\n').filter(l => l.trim()).slice(0, 5).join('\n');
-    addLog('success', `${tag} Scraped Book Chapter (${bookWordCount} words, flattened plain text):\n${preview}`);
+    finalTitle = articleJson.title || currentItem.keyword;
+    const bookCount = Array.isArray(articleJson.books) ? articleJson.books.length : 0;
+    addLog('success', `${tag} Scraped Book Article JSON: "${finalTitle}" (${bookCount} books recommended).`);
     broadcastState();
 
   } finally {
@@ -1954,21 +2134,45 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
 
   if (state.status !== 'RUNNING') return;
 
+  // Prepare metadata fields for the Bookspect payload
+  if (!articleJson.primary_keyword) {
+    articleJson.primary_keyword = currentItem.keyword;
+  }
+  if (!articleJson.slug) {
+    articleJson.slug = sanitizeSlug(currentItem.keyword) || sanitizeSlug(finalTitle);
+  }
+  if (scheduleDate) {
+    articleJson.date = scheduleDate;
+    articleJson.status = 'future';
+  } else if (!articleJson.status && settings.wpStatus) {
+    articleJson.status = settings.wpStatus;
+  }
+  if (settings.wpCategoryId && !articleJson.categories) {
+    const catIds = String(settings.wpCategoryId)
+      .split(',')
+      .map(id => parseInt(id.trim(), 10))
+      .filter(id => !isNaN(id) && id > 0);
+    if (catIds.length > 0) {
+      articleJson.categories = catIds;
+    }
+  }
+
   // 2. Publish / Download Output
   if (settings.testMode) {
-    addLog('info', `${tag} [Test Mode] Bypassing Bookspect endpoints. Downloading flattened text file...`);
+    addLog('info', `${tag} [Test Mode] Bypassing Bookspect endpoints. Downloading article JSON...`);
     broadcastState();
 
-    const safeKw = finalTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const safeKw = (articleJson.slug || finalTitle).replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const jsonFormatted = JSON.stringify(articleJson, null, 2);
     chrome.downloads.download({
-      url: 'data:text/plain;charset=utf-8,' + encodeURIComponent(flattenedText),
-      filename: `test-book-${safeKw}.txt`,
+      url: 'data:application/json;charset=utf-8,' + encodeURIComponent(jsonFormatted),
+      filename: `test-book-${safeKw}.json`,
       saveAs: false
     }, (downloadId) => {
       if (chrome.downloads.lastError) {
         addLog('error', `${tag} [Test Mode] Download failed: ${chrome.downloads.lastError.message}`);
       } else {
-        addLog('success', `${tag} [Test Mode] Flattened book document downloaded. ID: ${downloadId}`);
+        addLog('success', `${tag} [Test Mode] Book article JSON downloaded. ID: ${downloadId}`);
       }
       broadcastState();
     });
@@ -1978,44 +2182,21 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
     saveState();
     broadcastState();
   } else {
-    const slug = sanitizeSlug(currentItem.keyword) || sanitizeSlug(finalTitle);
-    const payload = {
-      title: finalTitle,
-      content: flattenedText,
-      keyword: currentItem.keyword,
-      slug: slug,
-      status: scheduleDate ? 'future' : (settings.wpStatus || 'publish')
-    };
-
-    if (scheduleDate) {
-      payload.date = scheduleDate;
-    }
-
-    if (settings.wpCategoryId) {
-      const catIds = String(settings.wpCategoryId)
-        .split(',')
-        .map(id => parseInt(id.trim(), 10))
-        .filter(id => !isNaN(id) && id > 0);
-      if (catIds.length > 0) {
-        payload.categories = catIds;
-      }
-    }
-
-    // Step 1: Validate
-    addLog('info', `${tag} Validating article with Bookspect endpoint...`);
+    // Step 1: Validate with Bookspect
+    addLog('info', `${tag} Validating article JSON with Bookspect endpoint...`);
     broadcastState();
 
-    await validateBookArticle(payload, settings);
+    await validateBookArticle(articleJson, settings);
     addLog('success', `${tag} Validation succeeded by Bookspect.`);
     broadcastState();
 
     if (state.status !== 'RUNNING') return;
 
-    // Step 2: Publish
-    addLog('info', `${tag} Publishing article to Bookspect...`);
+    // Step 2: Publish to Bookspect
+    addLog('info', `${tag} Publishing article JSON to Bookspect...`);
     broadcastState();
 
-    const pubResult = await publishBookArticle(payload, settings);
+    const pubResult = await publishBookArticle(articleJson, settings);
     addLog('success', `${tag} Published to Bookspect successfully! Article ID: ${pubResult.articleId}, Status: ${pubResult.articleStatus}.`);
     broadcastState();
 
