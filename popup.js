@@ -77,10 +77,11 @@ document.addEventListener('DOMContentLoaded', () => {
   // Toggle field required status dynamically based on Test Mode
   function toggleRequiredFields(isTestMode) {
     const isArticle = automationModeSelect.value === 'article';
+    const isBook = automationModeSelect.value === 'book';
     const inputs = [
       sbListNameInput, sbBatchLimitInput
     ];
-    if (isArticle) {
+    if (isArticle || isBook) {
       inputs.push(wpUrlInput, wpUsernameInput, wpAppPasswordInput);
     }
     const schedInputs = [schedStartDateInput, schedPostsPerDayInput];
@@ -99,7 +100,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     schedInputs.forEach(input => {
       if (input) {
-        if (isTestMode || wpStatusSelect.value !== 'schedule') {
+        if (isTestMode || wpStatusSelect.value !== 'schedule' || (!isArticle && !isBook)) {
           input.removeAttribute('required');
         } else {
           input.setAttribute('required', 'required');
@@ -109,7 +110,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     gptInputs.forEach(input => {
       if (input) {
-        if (isTestMode || !gptRewriteToggle.checked) {
+        if (isTestMode || !isArticle || !gptRewriteToggle.checked) {
           input.removeAttribute('required');
         } else {
           input.setAttribute('required', 'required');
@@ -119,7 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     listicleInputs.forEach(input => {
       if (input) {
-        if (isTestMode || !listicleToggle.checked) {
+        if (isTestMode || !isArticle || !listicleToggle.checked) {
           input.removeAttribute('required');
         } else {
           input.setAttribute('required', 'required');
@@ -241,23 +242,29 @@ Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Writ
 
   function updateAutomationModeUI() {
     const isArticle = automationModeSelect.value === 'article';
+    const isBook = automationModeSelect.value === 'book';
     const wpAccordion = document.getElementById('wordpress-accordion');
     const gptSwitch = document.getElementById('gpt-rewrite-switch-group');
     const listicleSwitch = document.getElementById('listicle-switch-group');
 
-    if (!isArticle) {
-      if (wpAccordion) wpAccordion.style.display = 'none';
-      if (gptSwitch) gptSwitch.style.display = 'none';
-      if (gptRewriteFields) gptRewriteFields.classList.remove('show');
-      if (listicleSwitch) listicleSwitch.style.display = 'none';
-      if (listicleFields) listicleFields.classList.remove('show');
-    } else {
-      if (wpAccordion) wpAccordion.style.display = 'block';
+    if (wpAccordion) {
+      wpAccordion.style.display = (isArticle || isBook) ? 'block' : 'none';
+      if (isBook && !wpUrlInput.value) {
+        wpUrlInput.value = 'https://bookspect.com';
+      }
+    }
+
+    if (isArticle) {
       if (gptSwitch) gptSwitch.style.display = 'block';
       if (listicleSwitch) listicleSwitch.style.display = 'block';
 
       updateGptRewriteFieldsVisibility();
       updateListicleFieldsVisibility();
+    } else {
+      if (gptSwitch) gptSwitch.style.display = 'none';
+      if (gptRewriteFields) gptRewriteFields.classList.remove('show');
+      if (listicleSwitch) listicleSwitch.style.display = 'none';
+      if (listicleFields) listicleFields.classList.remove('show');
     }
     toggleRequiredFields(testModeToggle.checked);
   }
@@ -527,14 +534,14 @@ Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Writ
               return;
             }
           }
-          if (items.gptRewrite) {
+          if (items.automationMode === 'article' && items.gptRewrite) {
             if (!items.customGptUrl) {
               alert('Please configure your Custom GPT URL under Automation & Prompt settings.');
               tabs[1].click();
               return;
             }
           }
-          if (items.listicle) {
+          if (items.automationMode === 'article' && items.listicle) {
             if (!items.listicleGptUrl) {
               alert('Please configure your Listicle GPT URL under Automation & Prompt settings.');
               tabs[1].click();

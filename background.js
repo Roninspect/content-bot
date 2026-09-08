@@ -1258,16 +1258,23 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
 }
 
 // Validate book article against Bookspect endpoint
-async function validateBookArticle(payload) {
-  const endpoint = 'https://bookspect.com/wp-json/ronin-book-publisher/v1/validate';
+async function validateBookArticle(payload, settings) {
+  const baseUrl = normalizeWpUrl(settings && settings.wpUrl ? settings.wpUrl : 'https://bookspect.com');
+  const endpoint = `${baseUrl}/wp-json/ronin-book-publisher/v1/validate`;
   console.log('[AutoAgent] Sending article to Bookspect validation endpoint...', endpoint);
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  if (settings && settings.wpUsername && settings.wpAppPassword) {
+    headers['Authorization'] = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
+  }
 
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
+    headers: headers,
     body: JSON.stringify(payload)
   });
 
@@ -1295,16 +1302,23 @@ async function validateBookArticle(payload) {
 }
 
 // Publish book article to Bookspect endpoint
-async function publishBookArticle(payload) {
-  const endpoint = 'https://bookspect.com/wp-json/ronin-book-publisher/v1/articles';
+async function publishBookArticle(payload, settings) {
+  const baseUrl = normalizeWpUrl(settings && settings.wpUrl ? settings.wpUrl : 'https://bookspect.com');
+  const endpoint = `${baseUrl}/wp-json/ronin-book-publisher/v1/articles`;
   console.log('[AutoAgent] Sending article to Bookspect articles endpoint...', endpoint);
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+
+  if (settings && settings.wpUsername && settings.wpAppPassword) {
+    headers['Authorization'] = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
+  }
 
   const response = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
+    headers: headers,
     body: JSON.stringify(payload)
   });
 
@@ -1849,7 +1863,7 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
 }
 
 // --- WORKER PIPELINE: BOOK PUBLISHER (BOOKSPECT) ---
-async function processBookKeyword(currentItem, itemIndex, totalCount, workerId, settings) {
+async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDate, workerId, settings) {
   const tag = `[Tab ${workerId} | "${currentItem.keyword}"]`;
   const phaseStr = state.isRetryPhase ? '[Retry Phase] ' : '';
 
@@ -1970,14 +1984,29 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, workerId, 
       title: finalTitle,
       content: flattenedText,
       keyword: currentItem.keyword,
-      slug: slug
+      slug: slug,
+      status: scheduleDate ? 'future' : (settings.wpStatus || 'publish')
     };
+
+    if (scheduleDate) {
+      payload.date = scheduleDate;
+    }
+
+    if (settings.wpCategoryId) {
+      const catIds = String(settings.wpCategoryId)
+        .split(',')
+        .map(id => parseInt(id.trim(), 10))
+        .filter(id => !isNaN(id) && id > 0);
+      if (catIds.length > 0) {
+        payload.categories = catIds;
+      }
+    }
 
     // Step 1: Validate
     addLog('info', `${tag} Validating article with Bookspect endpoint...`);
     broadcastState();
 
-    await validateBookArticle(payload);
+    await validateBookArticle(payload, settings);
     addLog('success', `${tag} Validation succeeded by Bookspect.`);
     broadcastState();
 
@@ -1987,7 +2016,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, workerId, 
     addLog('info', `${tag} Publishing article to Bookspect...`);
     broadcastState();
 
-    const pubResult = await publishBookArticle(payload);
+    const pubResult = await publishBookArticle(payload, settings);
     addLog('success', `${tag} Published to Bookspect successfully! Article ID: ${pubResult.articleId}, Status: ${pubResult.articleStatus}.`);
     broadcastState();
 
@@ -2109,7 +2138,7 @@ async function runStateMachine(isInternal = false) {
           state.queue = keywords;
         }
 
-        if (settings.automationMode === 'article') {
+        if (settings.automationMode === 'article' || settings.automationMode === 'book') {
           state.scheduleDates = settings.wpStatus === 'schedule' ? generateScheduleDates(state.queue.length, settings) : [];
         } else {
           state.scheduleDates = [];
@@ -2122,7 +2151,7 @@ async function runStateMachine(isInternal = false) {
         state.consecutiveFailures = 0;
         state.isRetryPhase = false;
         addLog('success', `Queue ready with ${state.queue.length} items.`);
-        if (settings.automationMode === 'article' && settings.wpStatus === 'schedule') {
+        if ((settings.automationMode === 'article' || settings.automationMode === 'book') && settings.wpStatus === 'schedule') {
           addLog('info', 'Generated schedules:\n' + state.scheduleDates.map((d, i) => `  - "${state.queue[i].keyword}" -> ${d}`).join('\n'));
         }
         saveState();
@@ -2154,7 +2183,8 @@ async function runStateMachine(isInternal = false) {
           if (settings.automationMode === 'pinterest') {
             await processPinterestKeyword(currentItem, itemIndex, total, workerId, settings);
           } else if (settings.automationMode === 'book') {
-            await processBookKeyword(currentItem, itemIndex, total, workerId, settings);
+            const scheduleDate = state.scheduleDates && state.scheduleDates[itemIndex] ? state.scheduleDates[itemIndex] : null;
+            await processBookKeyword(currentItem, itemIndex, total, scheduleDate, workerId, settings);
           } else {
             const scheduleDate = state.scheduleDates && state.scheduleDates[itemIndex] ? state.scheduleDates[itemIndex] : null;
             await processArticleKeyword(currentItem, itemIndex, total, scheduleDate, workerId, settings);
