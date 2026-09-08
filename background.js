@@ -110,7 +110,7 @@ function getSettings() {
     chrome.storage.local.get([
       'automationMode', 'sbUrl', 'sbAnonKey', 'sbListName', 'sbBatchLimit',
       'wpUrl', 'wpUsername', 'wpAppPassword', 'wpStatus', 'wpCategoryId',
-      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
+      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'bookPromptTemplate', 'testMode',
       'schedStartDate', 'schedPostsPerDay', 'schedHoursStart', 'schedHoursEnd',
       'gptRewrite', 'customGptUrl', 'listicle', 'listicleGptUrl', 'testKeywords'
     ], (items) => {
@@ -1886,8 +1886,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
 
     // Submit prompt
     const promptTpl = settings.bookPromptTemplate || settings.promptTemplate;
-    const formattedPrompt = promptTpl.replace(/{keyword}/gi, currentItem.keyword)
-      + '\n\nIMPORTANT: Do not attach the chapter as a file, document, or download block. Write the entire book chapter directly in the chat message response in clean, formatted plain text without markdown syntax.';
+    const formattedPrompt = promptTpl.replace(/{keyword}/gi, currentItem.keyword);
 
     addLog('info', `${tag} Submitting book prompt to Grok...`);
     broadcastState();

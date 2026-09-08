@@ -294,6 +294,16 @@ Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Writ
     updateAutomationModeUI();
   });
 
+  promptTemplateInput.addEventListener('input', () => {
+    if (automationModeSelect.value === 'pinterest') {
+      cachedPinterestPrompt = promptTemplateInput.value;
+    } else if (automationModeSelect.value === 'book') {
+      cachedBookPrompt = promptTemplateInput.value;
+    } else {
+      cachedArticlePrompt = promptTemplateInput.value;
+    }
+  });
+
   // Load Settings
   function loadSettings() {
     chrome.storage.local.get([
