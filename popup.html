@@ -97,6 +97,7 @@
             <select id="automation-mode" class="form-select" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid var(--border); background-color: var(--card-bg); color: var(--text-color);">
               <option value="article">WordPress Article Publisher</option>
               <option value="pinterest">Pinterest Pin Copywriter (Grok)</option>
+              <option value="book">Book Publisher (Bookspect)</option>
             </select>
           </div>
 
@@ -109,12 +110,12 @@
                 <span class="slider round"></span>
               </label>
             </div>
-            <span class="form-hint">Bypasses Supabase and WordPress validations. Pastes the prompt, scrapes ChatGPT, and downloads the output as a local document.</span>
+            <span class="form-hint">Bypasses Supabase and WordPress. The Keyword List Name is ignored; only the Test Keywords below are used.</span>
             
             <div id="test-mode-fields" class="test-mode-fields">
               <div class="form-group" style="margin-top: 12px; margin-bottom: 0;">
                 <label for="test-keywords">Test Keywords (one per line or comma-separated)</label>
-                <textarea id="test-keywords" rows="3" placeholder="High Protein Yogurt Bowl&#10;AI Content Automation" style="resize: vertical;"></textarea>
+                <textarea id="test-keywords" rows="3" placeholder="Enter test keywords, one per line" style="resize: vertical;"></textarea>
               </div>
             </div>
           </div>
@@ -246,7 +247,7 @@
               <div class="form-group">
                 <label for="prompt-template">Prompt Template</label>
                 <textarea id="prompt-template" rows="4" placeholder="Use {keyword} as placeholder..." required></textarea>
-                <span class="form-hint">Tip: Use <code>{keyword}</code> for keyword injection. In Pinterest Copywriter mode, use <code>{annotations}</code> to inject annotated interests.</span>
+                <span class="form-hint">Tip: Use <code>{keyword}</code> for keyword injection. In Pinterest Copywriter mode, use <code>{annotations}</code> to inject annotated interests. In Book Publisher mode, content is compiled as flattened plain text.</span>
               </div>
             </div>
           </div>

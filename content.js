@@ -3,18 +3,41 @@ console.log('[AutoAgent] Content script injected on host:', window.location.host
 
 const isGrok = window.location.hostname.includes('grok.com');
 
-// Heartbeat keepalive with the service worker
-const heartbeatInterval = setInterval(() => {
-  if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.sendMessage) {
+// Heartbeat keepalive with the service worker. An extension reload permanently
+// invalidates this page's old content-script context, so stop the timer instead
+// of throwing "Extension context invalidated" every five seconds.
+let heartbeatInterval = null;
+
+function stopHeartbeat() {
+  if (heartbeatInterval !== null) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
+function sendHeartbeat() {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id || !chrome.runtime.sendMessage) {
+      stopHeartbeat();
+      return;
+    }
+
     chrome.runtime.sendMessage({ action: 'heartbeat' }, () => {
-      if (chrome.runtime.lastError) {
-        // Suppress connection logs when background worker is asleep/reloading
+      try {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError && /extension context invalidated/i.test(runtimeError.message || '')) {
+          stopHeartbeat();
+        }
+      } catch (err) {
+        stopHeartbeat();
       }
     });
-  } else {
-    clearInterval(heartbeatInterval);
+  } catch (err) {
+    stopHeartbeat();
   }
-}, 5000);
+}
+
+heartbeatInterval = setInterval(sendHeartbeat, 5000);
 
 // React-controlled input setter workaround helper
 function setReactInputValue(el, val) {
@@ -113,13 +136,21 @@ function findStopButton() {
   }
 }
 
-// Dedicated helper to locate genuine Message-level Copy button (excluding code block copy buttons)
+function isVisibleElement(element) {
+  if (!element || !element.isConnected) return false;
+  const rect = element.getBoundingClientRect();
+  const style = window.getComputedStyle(element);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+// Dedicated helper to locate the latest genuine message-level Copy button.
 function findCopyButton(container) {
   // 1. Direct Grok "Copy response" button check (highest accuracy)
   if (isGrok) {
-    const directGrokBtn = document.querySelector('.last-response button[aria-label*="Copy response" i]')
-                       || document.querySelector('button[aria-label="Copy response" i]')
-                       || document.querySelector('button[aria-label*="Copy response" i]');
+    const directGrokButtons = Array.from(document.querySelectorAll(
+      '.last-response button[aria-label*="Copy response" i], button[aria-label="Copy response" i], button[aria-label*="Copy response" i]'
+    )).filter(button => !button.closest('pre, code, [class*="code"]') && isVisibleElement(button));
+    const directGrokBtn = directGrokButtons[directGrokButtons.length - 1];
     if (directGrokBtn) return directGrokBtn;
   }
 
@@ -242,60 +273,152 @@ function getWritingBlockContentContainer() {
       || container.querySelector('[class*="editor"]');
 }
 
-// Extracts plain text from inline message bubbles strictly by clicking the message copy button
-async function copyStandardAssistantContent(assistantNode, maxRetries = 40) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+function requestClipboardFocus(force = false) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (!force && document.hasFocus()) {
+        resolve(true);
+        return;
+      }
+
+      if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+        reject(new Error('Extension context invalidated while requesting clipboard focus.'));
+        return;
+      }
+
+      chrome.runtime.sendMessage({ action: 'requestClipboardFocus' }, (response) => {
+        try {
+          const runtimeError = chrome.runtime.lastError;
+          if (runtimeError) {
+            reject(new Error(runtimeError.message));
+            return;
+          }
+          if (!response || response.status !== 'success') {
+            reject(new Error(response?.message || 'Background could not focus the clipboard tab.'));
+            return;
+          }
+          setTimeout(() => resolve(document.hasFocus()), 250);
+        } catch (err) {
+          reject(err);
+        }
+      });
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function ensureClipboardFocus(attemptLabel) {
+  while (!document.hasFocus()) {
+    console.log(`[AutoAgent] ${attemptLabel}: requesting clipboard focus...`);
+    const focused = await requestClipboardFocus();
+    if (!focused) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+}
+
+async function readFreshClipboard(attemptLabel) {
+  while (true) {
+    await ensureClipboardFocus(attemptLabel);
+    try {
+      return await navigator.clipboard.readText();
+    } catch (err) {
+      const errorText = `${err.name || ''} ${err.message || ''}`;
+      if (/not focused|document is not focused|notallowederror/i.test(errorText)) {
+        console.warn(`[AutoAgent] ${attemptLabel}: clipboard read lost focus. Refocusing before reading again...`);
+        await requestClipboardFocus(true);
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function copyButtonToFreshClipboard(button, attemptLabel) {
+  const markerId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random()}`;
+  const clipboardMarker = `__AUTOAGENT_COPY_PENDING_${markerId}__`;
+
+  // Replace any previous clipboard value first. If Grok shows a Copy error and does
+  // not write anything, this marker remains and stale/unrelated content is rejected.
+  while (true) {
+    await ensureClipboardFocus(attemptLabel);
+    try {
+      await navigator.clipboard.writeText(clipboardMarker);
+      break;
+    } catch (err) {
+      const errorText = `${err.name || ''} ${err.message || ''}`;
+      if (!/not focused|document is not focused|notallowederror/i.test(errorText)) throw err;
+      console.warn(`[AutoAgent] ${attemptLabel}: clipboard marker write lost focus. Refocusing before trying again...`);
+      await requestClipboardFocus(true);
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  button.focus();
+  button.click();
+
+  // Grok can show its clipboard-error toast asynchronously. Give the Copy action
+  // 2.5 seconds to complete before checking whether it replaced our marker.
+  await new Promise(r => setTimeout(r, 2500));
+
+  // The page can lose focus after the click. Ask the background worker to refocus
+  // this same tab, then read the result without clicking Copy a second time first.
+  const copiedText = await readFreshClipboard(attemptLabel);
+  const normalizedText = copiedText ? copiedText.trim() : '';
+  if (!normalizedText || normalizedText === clipboardMarker || normalizedText.length < 20) {
+    console.warn(`[AutoAgent] ${attemptLabel} did not replace the clipboard marker.`);
+    return '';
+  }
+
+  return normalizedText;
+}
+
+function createFatalCopyError(label) {
+  const error = new Error(`${label} failed twice consecutively. Stopping automation to prevent unwanted content.`);
+  error.stopAutomation = true;
+  return error;
+}
+
+// Copy-button-only extraction. The button may take any amount of time to appear,
+// but two consecutive failed Copy/clipboard attempts stop the automation.
+async function copyStandardAssistantContent(assistantNode) {
+  let attempt = 0;
+  let consecutiveCopyProblems = 0;
+
+  while (true) {
+    attempt++;
     const btn = findCopyButton(assistantNode);
 
     if (btn) {
       try {
+        await ensureClipboardFocus(`Copy attempt ${attempt}`);
         console.log(`[AutoAgent] Clicking standard copy button (attempt ${attempt})...`);
         window.focus();
-        btn.focus();
-        btn.click();
-
-        // Clipboard write delay
-        await new Promise(r => setTimeout(r, 450));
-
-        const text = await navigator.clipboard.readText();
-        if (text && text.trim().length >= 20) {
-          const domWordCount = (assistantNode.innerText || '').split(/\s+/).filter(Boolean).length;
+        const text = await copyButtonToFreshClipboard(btn, `Copy attempt ${attempt}`);
+        if (text) {
           const copiedWordCount = text.split(/\s+/).filter(Boolean).length;
-
-          // If the DOM clearly has a large article (>200 words) but clipboard only received a tiny sub-snippet (<80 words)
-          if (domWordCount > 200 && copiedWordCount < 80) {
-            console.warn(`[AutoAgent] Copied snippet was only ${copiedWordCount} words while message has ${domWordCount} words. Retrying with message-level button...`);
-          } else {
-            console.log(`[AutoAgent] Successfully extracted ${copiedWordCount} words via native copy button.`);
-            return text.trim();
-          }
+          console.log(`[AutoAgent] Successfully extracted ${copiedWordCount} words via native copy button.`);
+          return text;
         }
+        consecutiveCopyProblems++;
       } catch (err) {
+        if (err.stopAutomation) throw err;
+        consecutiveCopyProblems++;
         console.warn(`[AutoAgent] Copy button clipboard read attempt ${attempt} failed: ${err.message}`);
-        if (err.message && err.message.includes('Document is not focused')) {
-          console.log('[AutoAgent] Tab unfocused for clipboard API. Extracting structured Markdown from DOM HTML...');
-          const converted = htmlToMarkdown(assistantNode.innerHTML);
-          if (converted && converted.length >= 50) {
-            const convertedWords = converted.split(/\s+/).filter(Boolean).length;
-            console.log(`[AutoAgent] Successfully compiled ${convertedWords} words of structured Markdown from DOM HTML.`);
-            return converted;
-          }
-        }
+      }
+
+      if (consecutiveCopyProblems >= 2) {
+        throw createFatalCopyError('Native Copy button extraction');
       }
     } else {
-      console.log(`[AutoAgent] Waiting for copy button to appear (attempt ${attempt}/${maxRetries})...`);
+      console.log(`[AutoAgent] Waiting for the latest Copy response button (attempt ${attempt})...`);
     }
 
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 500));
   }
-
-  // Fallback to structured HTML-to-Markdown conversion
-  const convertedFallback = htmlToMarkdown(assistantNode.innerHTML);
-  if (convertedFallback && convertedFallback.length >= 50) {
-    return convertedFallback;
-  }
-
-  throw new Error('Native Copy button extraction failed: Could not read content from clipboard after multiple attempts.');
 }
 
 // Debounced writing block observer with parallel poller timer and 3s inline bubble fallback
@@ -370,48 +493,40 @@ function waitForWritingBlock(onReady, onFallbackInline, onError, timeoutMs = 600
   check();
 }
 
-// Simulated copy click and clipboard extraction (strictly via native Canvas Copy button)
-async function copyWritingBlockContent(header, editor, maxRetries = 40) {
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+// Canvas Copy-button-only extraction with the same two-problem safety limit.
+async function copyWritingBlockContent(header, editor) {
+  let attempt = 0;
+  let consecutiveCopyProblems = 0;
+
+  while (true) {
+    attempt++;
     const btn = getWritingBlockCopyButton();
              
     if (btn) {
       try {
+        await ensureClipboardFocus(`Canvas Copy attempt ${attempt}`);
         console.log(`[AutoAgent] Clicking Canvas copy button (attempt ${attempt})...`);
         window.focus();
-        btn.focus();
-        btn.click();
-
-        // Clipboard write delay
-        await new Promise(r => setTimeout(r, 450));
-
-        const text = await navigator.clipboard.readText();
-        if (text && text.trim().length >= 20) {
-          return text.trim();
+        const text = await copyButtonToFreshClipboard(btn, `Canvas Copy attempt ${attempt}`);
+        if (text) {
+          return text;
         }
+        consecutiveCopyProblems++;
       } catch (err) {
+        if (err.stopAutomation) throw err;
+        consecutiveCopyProblems++;
         console.warn(`[AutoAgent] Canvas copy button clipboard read attempt ${attempt} failed: ${err.message}`);
-        if (err.message && err.message.includes('Document is not focused')) {
-          console.log('[AutoAgent] Tab unfocused for Canvas clipboard API. Extracting structured Markdown from editor HTML...');
-          const converted = htmlToMarkdown(editor.innerHTML);
-          if (converted && converted.length >= 20) {
-            return converted;
-          }
-        }
+      }
+
+      if (consecutiveCopyProblems >= 2) {
+        throw createFatalCopyError('Canvas Copy button extraction');
       }
     } else {
-      console.log(`[AutoAgent] Waiting for Canvas copy button to appear (attempt ${attempt}/${maxRetries})...`);
+      console.log(`[AutoAgent] Waiting for Canvas Copy button (attempt ${attempt})...`);
     }
 
-    await new Promise(r => setTimeout(r, 600));
+    await new Promise(r => setTimeout(r, 500));
   }
-
-  const convertedFallback = htmlToMarkdown(editor.innerHTML);
-  if (convertedFallback && convertedFallback.length >= 20) {
-    return convertedFallback;
-  }
-
-  throw new Error('Native Canvas Copy button extraction failed: Could not read content from clipboard after multiple attempts.');
 }
 
 // Consolidates wait and extraction for Custom GPT intro rewrites
@@ -608,59 +723,6 @@ function isGptIntroDone() {
   }
 
   return { done: false };
-}
-
-// Simple HTML-to-Markdown converter helper (used as robust fallback)
-function htmlToMarkdown(html) {
-  if (!html) return '';
-  let md = html;
-
-  // Replace line breaks
-  md = md.replace(/<br\s*\/?>/gi, '\n');
-
-  // Headers (H1 to H6)
-  md = md.replace(/<h1>([\s\S]*?)<\/h1>/gi, '# $1\n\n');
-  md = md.replace(/<h2>([\s\S]*?)<\/h2>/gi, '## $1\n\n');
-  md = md.replace(/<h3>([\s\S]*?)<\/h3>/gi, '### $1\n\n');
-  md = md.replace(/<h4>([\s\S]*?)<\/h4>/gi, '#### $1\n\n');
-  md = md.replace(/<h5>([\s\S]*?)<\/h5>/gi, '##### $1\n\n');
-  md = md.replace(/<h6>([\s\S]*?)<\/h6>/gi, '###### $1\n\n');
-
-  // Bold & Italic
-  md = md.replace(/<strong>([\s\S]*?)<\/strong>/gi, '**$1**');
-  md = md.replace(/<b>([\s\S]*?)<\/b>/gi, '**$1**');
-  md = md.replace(/<em>([\s\S]*?)<\/em>/gi, '*$1*');
-  md = md.replace(/<i>([\s\S]*?)<\/i>/gi, '*$1*');
-
-  // Code blocks (pre/code)
-  md = md.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, '```\n$1\n```\n\n');
-  md = md.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '`$1`');
-
-  // Lists
-  md = md.replace(/<li>([\s\S]*?)<\/li>/gi, (match, p1) => {
-    return `- ${p1.trim()}\n`;
-  });
-  md = md.replace(/<ul>([\s\S]*?)<\/ul>/gi, '$1\n');
-  md = md.replace(/<ol>([\s\S]*?)<\/ol>/gi, '$1\n');
-
-  // Paragraphs
-  md = md.replace(/<p>([\s\S]*?)<\/p>/gi, '$1\n\n');
-
-  // Blockquotes
-  md = md.replace(/<blockquote>([\s\S]*?)<\/blockquote>/gi, '> $1\n\n');
-
-  // Remove any remaining HTML tags
-  md = md.replace(/<[^>]+>/g, '');
-
-  // Decode standard HTML entities using browser context
-  const textarea = document.createElement('textarea');
-  textarea.innerHTML = md;
-  md = textarea.value;
-
-  // Clean up excess newlines
-  md = md.replace(/\n{3,}/g, '\n\n');
-
-  return md.trim();
 }
 
 // Listen for execution commands from background worker
@@ -869,7 +931,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           console.error('[AutoAgent] Native copy extraction failed:', err.message);
           sendResponse({ 
             status: 'error', 
-            message: `Native copy extraction failed: ${err.message}` 
+            message: `Native copy extraction failed: ${err.message}`,
+            fatal: Boolean(err.stopAutomation)
           });
         });
     } else {
@@ -884,7 +947,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({ status: 'success', content: res.content, markdown: res.markdown });
       })
       .catch(err => {
-        sendResponse({ status: 'error', message: err.message || err.toString() });
+        sendResponse({ status: 'error', message: err.message || err.toString(), fatal: Boolean(err.stopAutomation) });
       });
     return true;
   }

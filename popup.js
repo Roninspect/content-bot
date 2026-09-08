@@ -76,11 +76,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Toggle field required status dynamically based on Test Mode
   function toggleRequiredFields(isTestMode) {
-    const isPinterest = automationModeSelect.value === 'pinterest';
+    const isArticle = automationModeSelect.value === 'article';
     const inputs = [
       sbListNameInput, sbBatchLimitInput
     ];
-    if (!isPinterest) {
+    if (isArticle) {
       inputs.push(wpUrlInput, wpUsernameInput, wpAppPasswordInput);
     }
     const schedInputs = [schedStartDateInput, schedPostsPerDayInput];
@@ -126,6 +126,14 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
     });
+
+    if (testKeywordsInput) {
+      if (isTestMode) {
+        testKeywordsInput.setAttribute('required', 'required');
+      } else {
+        testKeywordsInput.removeAttribute('required');
+      }
+    }
   }
 
   // Update visibility of scheduling options
@@ -222,17 +230,22 @@ Output strictly in this JSON format, with no extra text before or after:
   "description": "Some description"
 }`;
 
+  const DEFAULT_BOOK_PROMPT = `Write a comprehensive, engaging book chapter/guide about {keyword}.
+Structure the text into logical sections with clear descriptive titles on their own lines.
+Do NOT use markdown headers (#, ##, ###), markdown bold (**), or asterisks. Write in clean, formatted plain text with standard paragraphs.`;
+
   let cachedArticlePrompt = DEFAULT_PROMPT;
   let cachedPinterestPrompt = DEFAULT_PINTEREST_PROMPT;
+  let cachedBookPrompt = DEFAULT_BOOK_PROMPT;
   let previousMode = 'article';
 
   function updateAutomationModeUI() {
-    const isPinterest = automationModeSelect.value === 'pinterest';
+    const isArticle = automationModeSelect.value === 'article';
     const wpAccordion = document.getElementById('wordpress-accordion');
     const gptSwitch = document.getElementById('gpt-rewrite-switch-group');
     const listicleSwitch = document.getElementById('listicle-switch-group');
 
-    if (isPinterest) {
+    if (!isArticle) {
       if (wpAccordion) wpAccordion.style.display = 'none';
       if (gptSwitch) gptSwitch.style.display = 'none';
       if (gptRewriteFields) gptRewriteFields.classList.remove('show');
@@ -253,6 +266,8 @@ Output strictly in this JSON format, with no extra text before or after:
     // Cache the current prompt to the old mode's key
     if (previousMode === 'pinterest') {
       cachedPinterestPrompt = promptTemplateInput.value;
+    } else if (previousMode === 'book') {
+      cachedBookPrompt = promptTemplateInput.value;
     } else {
       cachedArticlePrompt = promptTemplateInput.value;
     }
@@ -263,6 +278,8 @@ Output strictly in this JSON format, with no extra text before or after:
     // Load prompt from cache for the new mode
     if (currentMode === 'pinterest') {
       promptTemplateInput.value = cachedPinterestPrompt;
+    } else if (currentMode === 'book') {
+      promptTemplateInput.value = cachedBookPrompt;
     } else {
       promptTemplateInput.value = cachedArticlePrompt;
     }
@@ -275,7 +292,7 @@ Output strictly in this JSON format, with no extra text before or after:
     chrome.storage.local.get([
       'automationMode', 'sbUrl', 'sbAnonKey', 'sbListName', 'sbBatchLimit',
       'wpUrl', 'wpUsername', 'wpAppPassword', 'wpStatus', 'wpCategoryId',
-      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'testMode',
+      'actionDelay', 'concurrency', 'promptTemplate', 'pinterestPromptTemplate', 'bookPromptTemplate', 'testMode',
       'schedStartDate', 'schedPostsPerDay', 'schedHoursStart', 'schedHoursEnd',
       'gptRewrite', 'customGptUrl', 'listicle', 'listicleGptUrl', 'testKeywords'
     ], (items) => {
@@ -297,8 +314,15 @@ Output strictly in this JSON format, with no extra text before or after:
       
       cachedArticlePrompt = items.promptTemplate || DEFAULT_PROMPT;
       cachedPinterestPrompt = items.pinterestPromptTemplate || DEFAULT_PINTEREST_PROMPT;
+      cachedBookPrompt = items.bookPromptTemplate || DEFAULT_BOOK_PROMPT;
       previousMode = items.automationMode || 'article';
-      promptTemplateInput.value = (previousMode === 'pinterest') ? cachedPinterestPrompt : cachedArticlePrompt;
+      if (previousMode === 'pinterest') {
+        promptTemplateInput.value = cachedPinterestPrompt;
+      } else if (previousMode === 'book') {
+        promptTemplateInput.value = cachedBookPrompt;
+      } else {
+        promptTemplateInput.value = cachedArticlePrompt;
+      }
 
       testModeToggle.checked = items.testMode || false;
       testKeywordsInput.value = items.testKeywords || '';
@@ -338,6 +362,8 @@ Output strictly in this JSON format, with no extra text before or after:
 
     if (automationModeSelect.value === 'pinterest') {
       cachedPinterestPrompt = promptTemplateInput.value.trim();
+    } else if (automationModeSelect.value === 'book') {
+      cachedBookPrompt = promptTemplateInput.value.trim();
     } else {
       cachedArticlePrompt = promptTemplateInput.value.trim();
     }
@@ -357,6 +383,7 @@ Output strictly in this JSON format, with no extra text before or after:
       concurrency: parseInt(concurrencySelect.value) || 2,
       promptTemplate: cachedArticlePrompt,
       pinterestPromptTemplate: cachedPinterestPrompt,
+      bookPromptTemplate: cachedBookPrompt,
       testMode: testModeToggle.checked,
       schedStartDate: schedStartDateInput.value,
       schedPostsPerDay: parseInt(schedPostsPerDayInput.value) || 3,
@@ -473,7 +500,13 @@ Output strictly in this JSON format, with no extra text before or after:
       'automationMode', 'testMode', 'sbUrl', 'sbAnonKey', 'sbListName', 'wpUrl', 'wpUsername', 'wpAppPassword',
       'wpStatus', 'schedStartDate', 'schedPostsPerDay', 'gptRewrite', 'customGptUrl', 'listicle', 'listicleGptUrl', 'testKeywords'
     ], (items) => {
-      if (!items.testMode) {
+      if (items.testMode) {
+        if (!items.testKeywords || !items.testKeywords.trim()) {
+          alert('Test Mode is enabled, but Test Keywords is empty. Add Test Keywords or disable Test Mode to fetch the selected Supabase list.');
+          tabs[1].click();
+          return;
+        }
+      } else {
         const isPinterest = items.automationMode === 'pinterest';
         if (isPinterest) {
           if (!items.sbListName) {
