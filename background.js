@@ -1486,6 +1486,27 @@ async function validateBookArticle(payload, settings) {
 async function publishBookArticle(payload, settings) {
   const baseUrl = normalizeWpUrl(settings && settings.wpUrl ? settings.wpUrl : 'https://bookspect.com');
   const endpoint = `${baseUrl}/wp-json/ronin-book-publisher/v1/articles`;
+  const slug = payload.slug || sanitizeSlug(payload.keyword || payload.title);
+
+  // Pre-check: If post already exists (e.g. from previous run or retry), skip duplicate publishing
+  if (slug) {
+    try {
+      const duplicateCheck = await findExistingWordPressPost(settings, slug);
+      if (duplicateCheck && duplicateCheck.success && duplicateCheck.post) {
+        return {
+          success: true,
+          duplicate: true,
+          skipped: true,
+          articleId: duplicateCheck.post.id,
+          articleStatus: duplicateCheck.post.status || 'published',
+          data: duplicateCheck.post
+        };
+      }
+    } catch (e) {
+      // Continue to publishing if check fails
+    }
+  }
+
   console.log('[AutoAgent] Sending article to Bookspect articles endpoint...', endpoint);
 
   const headers = {
@@ -1497,36 +1518,64 @@ async function publishBookArticle(payload, settings) {
     headers['Authorization'] = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
   }
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify(payload)
-  });
+  let response = null;
+  let networkError = null;
 
-  const contentType = response.headers.get('Content-Type') || '';
-  let data = null;
-  if (contentType.includes('application/json')) {
-    data = await response.json();
-  } else {
-    const errorText = await response.text();
-    const cleanText = errorText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 300);
-    throw new Error(`Bookspect publishing returned non-JSON response (HTTP ${response.status}). Snippet: "${cleanText}"`);
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(payload)
+    });
+  } catch (err) {
+    networkError = err;
   }
 
-  if (!response.ok) {
-    const errorMsg = data && (data.message || data.error) ? (data.message || data.error) : `HTTP status ${response.status}`;
-    throw new Error(`Bookspect publishing failed: ${errorMsg}`);
+  // Handle successful response
+  if (response && response.ok) {
+    const contentType = response.headers.get('Content-Type') || '';
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      const articleId = data.id || data.article_id || data.post_id || 'OK';
+      const articleStatus = data.status || 'published';
+      return {
+        success: true,
+        articleId,
+        articleStatus,
+        data
+      };
+    }
   }
 
-  const articleId = data.id || data.article_id || data.post_id || 'OK';
-  const articleStatus = data.status || 'published';
+  // Post-check recovery: If LiteSpeed timed out the HTTP response (HTTP 500 / 504 / timeout),
+  // the server script often succeeds in creating the post right before or as LiteSpeed cuts the connection.
+  if (slug) {
+    console.log(`[AutoAgent] Bookspect publish call ended with status ${response ? response.status : 'network error'}. Verifying if post "${slug}" was created on WordPress...`);
+    await delay(2500);
+    try {
+      const verifyCheck = await findExistingWordPressPost(settings, slug);
+      if (verifyCheck && verifyCheck.success && verifyCheck.post) {
+        console.log(`[AutoAgent] Verified post exists on WordPress despite server timeout! Post ID: ${verifyCheck.post.id}`);
+        return {
+          success: true,
+          recoveredFromTimeout: true,
+          articleId: verifyCheck.post.id,
+          articleStatus: verifyCheck.post.status || 'published',
+          data: verifyCheck.post
+        };
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
 
-  return {
-    success: true,
-    articleId,
-    articleStatus,
-    data
-  };
+  if (!response) {
+    throw networkError || new Error('Network request to Bookspect failed.');
+  }
+
+  const errorText = await response.text();
+  const cleanText = errorText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 300);
+  throw new Error(`Bookspect publishing failed (HTTP ${response.status}): "${cleanText}"`);
 }
 
 // --- STATE MACHINE & CONCURRENT WORKER POOL ---
@@ -2197,7 +2246,13 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
     broadcastState();
 
     const pubResult = await publishBookArticle(articleJson, settings);
-    addLog('success', `${tag} Published to Bookspect successfully! Article ID: ${pubResult.articleId}, Status: ${pubResult.articleStatus}.`);
+    if (pubResult.skipped) {
+      addLog('info', `${tag} Post already exists on WordPress (Post ID: ${pubResult.articleId}). Skipping duplicate creation.`);
+    } else if (pubResult.recoveredFromTimeout) {
+      addLog('warning', `${tag} Server connection timed out after 30s, but verified article was created successfully on WordPress! Post ID: ${pubResult.articleId}.`);
+    } else {
+      addLog('success', `${tag} Published to Bookspect successfully! Article ID: ${pubResult.articleId}, Status: ${pubResult.articleStatus}.`);
+    }
     broadcastState();
 
     // Step 3: Supabase update
