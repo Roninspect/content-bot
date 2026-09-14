@@ -57,6 +57,28 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Fetch with automatic retry on transient network errors (e.g. "Failed to fetch", connection drops, timeouts)
+async function fetchWithRetry(url, options = {}, maxRetries = 3, initialDelayMs = 2000) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(url, options);
+      return response;
+    } catch (err) {
+      lastError = err;
+      const isNetworkError = err && (err.name === 'TypeError' || /failed to fetch|network|timeout|connection|load failed/i.test(err.message || ''));
+      if (isNetworkError && attempt < maxRetries) {
+        const delayTime = initialDelayMs * Math.pow(1.5, attempt - 1);
+        console.warn(`[AutoAgent] Network request to "${url}" failed (${err.message}). Retrying attempt ${attempt + 1}/${maxRetries} in ${Math.round(delayTime)}ms...`);
+        await delay(delayTime);
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw lastError;
+}
+
 // Log builder
 function addLog(type, message) {
   const time = new Date().toLocaleTimeString();
@@ -949,7 +971,7 @@ async function fetchListId(settings) {
   const sbUrl = settings.sbUrl.replace(/\/$/, '');
   const endpoint = `${sbUrl}/rest/v1/pin_kw_lists?name=eq.${encodeURIComponent(settings.sbListName)}&select=id`;
   
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'GET',
     headers: {
       'apikey': settings.sbAnonKey,
@@ -973,7 +995,7 @@ async function fetchPendingKeywords(settings, listId) {
   const sbUrl = settings.sbUrl.replace(/\/$/, '');
   const endpoint = `${sbUrl}/rest/v1/pin_keywords?status=in.(pending,failed)&kw_list_id=eq.${listId}&limit=${settings.sbBatchLimit}&select=id,keyword`;
   
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'GET',
     headers: {
       'apikey': settings.sbAnonKey,
@@ -993,7 +1015,7 @@ async function updateKeywordStatus(settings, kwId, status) {
   const sbUrl = settings.sbUrl.replace(/\/$/, '');
   const endpoint = `${sbUrl}/rest/v1/pin_keywords?id=eq.${encodeURIComponent(kwId)}&select=id,status`;
   
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'PATCH',
     headers: {
       'apikey': settings.sbAnonKey,
@@ -1200,7 +1222,7 @@ async function updatePinImageSlot(settings, keywordId, slotIndex, title, descrip
   const sbUrl = settings.sbUrl.replace(/\/$/, '');
   const endpoint = `${sbUrl}/rest/v1/pin_images?keyword_id=eq.${keywordId}&slot_index=eq.${slotIndex}`;
   
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'PATCH',
     headers: {
       'apikey': settings.sbAnonKey,
@@ -1275,7 +1297,7 @@ async function findExistingWordPressPost(settings, slug) {
   });
 
   try {
-    const response = await fetch(`${wpUrl}/wp-json/wp/v2/posts?${params.toString()}`, {
+    const response = await fetchWithRetry(`${wpUrl}/wp-json/wp/v2/posts?${params.toString()}`, {
       method: 'GET',
       headers: {
         'Authorization': authHeader,
@@ -1303,7 +1325,12 @@ async function findExistingWordPressPost(settings, slug) {
     const exactMatch = posts.find(post => post && post.slug === slug) || null;
     return { success: true, post: exactMatch };
   } catch (err) {
-    return { success: false, message: err.message || err.toString() };
+    const errMsg = err && err.message ? err.message : String(err);
+    const isNetworkError = /failed to fetch|network|timeout|connection|load failed/i.test(errMsg);
+    const detailedMsg = isNetworkError
+      ? `Network error reaching WordPress site (${errMsg}). Please verify your internet connection and that the WordPress site is online.`
+      : errMsg;
+    return { success: false, message: detailedMsg };
   }
 }
 
@@ -1360,7 +1387,7 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
 
     // Attempt 1: Standard JSON payload
     console.log(`[AutoAgent] Attempting WordPress ${operation} with JSON payload at ${endpoint}...`);
-    let response = await fetch(endpoint, {
+    let response = await fetchWithRetry(endpoint, {
       method: 'POST',
       headers: {
         'Authorization': authHeader,
@@ -1387,7 +1414,7 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
         });
       }
 
-      response = await fetch(endpoint, {
+      response = await fetchWithRetry(endpoint, {
         method: 'POST',
         headers: {
           'Authorization': authHeader,
@@ -1434,7 +1461,12 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
       postLink: data.link || ''
     };
   } catch (err) {
-    return { success: false, message: err.message || err.toString() };
+    const errMsg = err && err.message ? err.message : String(err);
+    const isNetworkError = /failed to fetch|network|timeout|connection|load failed/i.test(errMsg);
+    const detailedMsg = isNetworkError
+      ? `Network error publishing to WordPress (${errMsg}). Please verify your internet connection and that the WordPress site is online.`
+      : errMsg;
+    return { success: false, message: detailedMsg };
   }
 }
 
@@ -1453,7 +1485,7 @@ async function validateBookArticle(payload, settings) {
     headers['Authorization'] = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
   }
 
-  const response = await fetch(endpoint, {
+  const response = await fetchWithRetry(endpoint, {
     method: 'POST',
     headers: headers,
     body: JSON.stringify(payload)
@@ -1522,7 +1554,7 @@ async function publishBookArticle(payload, settings) {
   let networkError = null;
 
   try {
-    response = await fetch(endpoint, {
+    response = await fetchWithRetry(endpoint, {
       method: 'POST',
       headers: headers,
       body: JSON.stringify(payload)
