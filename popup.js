@@ -76,7 +76,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Toggle field required status dynamically based on Test Mode
   function toggleRequiredFields(isTestMode) {
-    const isArticle = automationModeSelect.value === 'article';
+    const isArticle = automationModeSelect.value === 'article' || automationModeSelect.value === 'replace';
     const isBook = automationModeSelect.value === 'book';
     const inputs = [
       sbListNameInput, sbBatchLimitInput
@@ -389,7 +389,7 @@ Before returning the result, verify that all facts are supported, the JSON is va
   let previousMode = 'article';
 
   function updateAutomationModeUI() {
-    const isArticle = automationModeSelect.value === 'article';
+    const isArticle = automationModeSelect.value === 'article' || automationModeSelect.value === 'replace';
     const isBook = automationModeSelect.value === 'book';
     const wpAccordion = document.getElementById('wordpress-accordion');
     const gptSwitch = document.getElementById('gpt-rewrite-switch-group');
@@ -692,14 +692,14 @@ Before returning the result, verify that all facts are supported, the JSON is va
               return;
             }
           }
-          if (items.automationMode === 'article' && items.gptRewrite) {
+          if ((items.automationMode === 'article' || items.automationMode === 'replace') && items.gptRewrite) {
             if (!items.customGptUrl) {
               alert('Please configure your Custom GPT URL under Automation & Prompt settings.');
               tabs[1].click();
               return;
             }
           }
-          if (items.automationMode === 'article' && items.listicle) {
+          if ((items.automationMode === 'article' || items.automationMode === 'replace') && items.listicle) {
             if (!items.listicleGptUrl) {
               alert('Please configure your Listicle GPT URL under Automation & Prompt settings.');
               tabs[1].click();

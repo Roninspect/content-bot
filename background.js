@@ -1334,8 +1334,170 @@ async function findExistingWordPressPost(settings, slug) {
   }
 }
 
-// WordPress publisher with duplicate-slug protection. If the slug already exists,
-// skip the WordPress write; the caller will still mark the Supabase item completed.
+// Locate an existing WordPress post to replace its content.
+// Tries exact slug match first, then searches by keyword.
+async function findWordPressPostForReplacement(settings, keyword) {
+  if (!keyword) {
+    return { success: false, message: 'Keyword is empty.' };
+  }
+
+  const wpUrl = normalizeWpUrl(settings.wpUrl);
+  const authHeader = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
+  const slug = sanitizeSlug(keyword);
+
+  // Strategy 1: Search by exact slug
+  if (slug) {
+    try {
+      const slugParams = new URLSearchParams({
+        slug,
+        status: 'publish,future,draft,pending,private',
+        context: 'edit',
+        per_page: '1',
+        _fields: 'id,slug,status,link,title'
+      });
+
+      const response = await fetchWithRetry(`${wpUrl}/wp-json/wp/v2/posts?${slugParams.toString()}`, {
+        method: 'GET',
+        headers: {
+          'Authorization': authHeader,
+          'Accept': 'application/json'
+        }
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data) && data.length > 0) {
+          const match = data.find(p => p && p.slug === slug) || data[0];
+          return { success: true, post: match };
+        }
+      }
+    } catch (e) {
+      console.warn('[AutoAgent] Slug lookup error:', e);
+    }
+  }
+
+  // Strategy 2: Search by keyword string in WordPress
+  try {
+    const searchParams = new URLSearchParams({
+      search: keyword,
+      status: 'publish,future,draft,pending,private',
+      context: 'edit',
+      per_page: '5',
+      _fields: 'id,slug,status,link,title'
+    });
+
+    const searchResponse = await fetchWithRetry(`${wpUrl}/wp-json/wp/v2/posts?${searchParams.toString()}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': authHeader,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (searchResponse.ok) {
+      const data = await searchResponse.json();
+      if (Array.isArray(data) && data.length > 0) {
+        // Look for exact slug match
+        const exactSlugMatch = data.find(p => p && p.slug === slug);
+        if (exactSlugMatch) return { success: true, post: exactSlugMatch };
+
+        // Look for title match
+        const kwLower = keyword.trim().toLowerCase();
+        const titleMatch = data.find(p => {
+          const t = p && p.title && (p.title.rendered || p.title.raw || p.title);
+          return t && String(t).trim().toLowerCase().includes(kwLower);
+        });
+        if (titleMatch) return { success: true, post: titleMatch };
+
+        // Fallback to first search result
+        return { success: true, post: data[0] };
+      }
+    }
+  } catch (err) {
+    const errMsg = err && err.message ? err.message : String(err);
+    return { success: false, message: `Failed to search WordPress: ${errMsg}` };
+  }
+
+  return {
+    success: false,
+    message: `No existing WordPress post found for keyword "${keyword}" (slug: "${slug}").`
+  };
+}
+
+// Updates the content of an existing WordPress post by its ID (Replace Mode)
+async function updateWordPressPostContent(settings, postId, newContent) {
+  const wpUrl = normalizeWpUrl(settings.wpUrl);
+  const endpoint = `${wpUrl}/wp-json/wp/v2/posts/${postId}`;
+  const authHeader = 'Basic ' + btoa(settings.wpUsername + ':' + settings.wpAppPassword);
+
+  const payload = {
+    content: newContent
+  };
+
+  try {
+    console.log(`[AutoAgent] Updating WordPress post ID ${postId} with new content at ${endpoint}...`);
+    let response = await fetchWithRetry(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': authHeader,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    // Fallback: If HTTP 415, 406 or 400 is returned, retry as urlencoded form-data
+    if (!response.ok && (response.status === 415 || response.status === 406 || response.status === 400)) {
+      console.warn(`[AutoAgent] WordPress update returned status ${response.status}. Retrying as urlencoded form-data...`);
+      const formParams = new URLSearchParams();
+      formParams.append('content', payload.content);
+
+      response = await fetchWithRetry(endpoint, {
+        method: 'POST',
+        headers: {
+          'Authorization': authHeader,
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: formParams.toString()
+      });
+    }
+
+    const contentType = response.headers.get('Content-Type') || '';
+    if (!contentType.includes('application/json')) {
+      const errorText = await response.text();
+      const cleanText = errorText.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 300);
+      return {
+        success: false,
+        message: `WordPress returned non-JSON response (HTTP ${response.status}). Snippet: "${cleanText}"`
+      };
+    }
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      let parsedError;
+      try { parsedError = JSON.parse(errorText); } catch(e) {}
+      const errorMsg = parsedError && parsedError.message ? parsedError.message : (errorText.trim() || response.statusText);
+      return { success: false, message: `HTTP ${response.status}: ${errorMsg}` };
+    }
+
+    const data = await response.json();
+    return {
+      success: true,
+      postId: data.id,
+      postStatus: data.status,
+      postLink: data.link || '',
+      postTitle: data.title && (data.title.rendered || data.title.raw) ? (data.title.rendered || data.title.raw) : ''
+    };
+  } catch (err) {
+    const errMsg = err && err.message ? err.message : String(err);
+    const isNetworkError = /failed to fetch|network|timeout|connection|load failed/i.test(errMsg);
+    const detailedMsg = isNetworkError
+      ? `Network error updating WordPress post (${errMsg}). Please check your connection or WordPress site availability.`
+      : errMsg;
+    return { success: false, message: detailedMsg };
+  }
+}
+
+// WordPress publisher
 async function publishToWordPress(settings, title, content, slug, scheduleDate = null) {
   const wpUrl = normalizeWpUrl(settings.wpUrl);
   const postsEndpoint = `${wpUrl}/wp-json/wp/v2/posts`;
@@ -1781,6 +1943,25 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
   addLog('info', `${tag} ${phaseStr}Processing keyword ${itemIndex + 1}/${totalCount}...`);
   broadcastState();
 
+  const isReplace = settings.automationMode === 'replace';
+  let targetPost = null;
+
+  // In Replace Mode, locate the existing WordPress post first
+  if (isReplace && !settings.testMode) {
+    addLog('info', `${tag} Looking up existing WordPress post for "${currentItem.keyword}" to replace...`);
+    broadcastState();
+    const findResult = await findWordPressPostForReplacement(settings, currentItem.keyword);
+    if (!findResult.success || !findResult.post) {
+      throw new Error(`WordPress replace pre-check failed: ${findResult.message || 'Post not found.'}`);
+    }
+    targetPost = findResult.post;
+    const postTitle = targetPost.title && (targetPost.title.rendered || targetPost.title.raw || targetPost.title) 
+      ? (targetPost.title.rendered || targetPost.title.raw || targetPost.title) 
+      : targetPost.slug;
+    addLog('success', `${tag} Found existing WordPress post: ID ${targetPost.id} ("${postTitle}").`);
+    broadcastState();
+  }
+
   // 1. Open Grok tab
   const tab = await createTab('https://grok.com/');
 
@@ -1999,26 +2180,53 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
 
   if (state.status !== 'RUNNING') return;
 
-  // 4. Publish / Download Output
+  // 4. Publish / Replace / Download Output
   if (settings.testMode) {
     addLog('info', `${tag} [Test Mode] Bypassing WordPress/Supabase. Downloading Markdown file...`);
     broadcastState();
 
     const safeKw = finalTitle.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const dateSuffix = scheduleDate ? `-${scheduleDate.replace(/[:]/g, '_')}` : '';
+    const filePrefix = isReplace ? 'test-replaced-' : 'test-article-';
     chrome.downloads.download({
       url: 'data:text/markdown;charset=utf-8,' + encodeURIComponent(finalMarkdown),
-      filename: `test-article-${safeKw}${dateSuffix}.md`,
+      filename: `${filePrefix}${safeKw}${dateSuffix}.md`,
       saveAs: false
     }, (downloadId) => {
       if (chrome.downloads.lastError) {
         addLog('error', `${tag} [Test Mode] Download failed: ${chrome.downloads.lastError.message}`);
       } else {
         const schedMsg = scheduleDate ? ` (simulated schedule: ${scheduleDate})` : '';
-        addLog('success', `${tag} [Test Mode] Markdown document downloaded${schedMsg}. ID: ${downloadId}`);
+        const modeLabel = isReplace ? 'Replaced markdown document' : 'Markdown document';
+        addLog('success', `${tag} [Test Mode] ${modeLabel} downloaded${schedMsg}. ID: ${downloadId}`);
       }
       broadcastState();
     });
+
+    state.stats.processed++;
+    state.stats.remaining = state.queue.length - state.stats.processed;
+    saveState();
+    broadcastState();
+  } else if (isReplace) {
+    const compiledH2Count = (finalHtml.match(/<h2\b/g) || []).length;
+    const compiledH3Count = (finalHtml.match(/<h3\b/g) || []).length;
+    const compiledTableCount = (finalHtml.match(/<table\b/g) || []).length;
+    addLog('info', `${tag} WordPress formatting compiled: ${compiledH2Count} H2, ${compiledH3Count} H3, ${compiledTableCount} table(s).`);
+    addLog('info', `${tag} Replacing content of WordPress post ID ${targetPost.id}...`);
+    broadcastState();
+
+    const replaceResult = await updateWordPressPostContent(settings, targetPost.id, finalHtml);
+    if (!replaceResult.success) {
+      throw new Error(`WordPress content replacement failed: ${replaceResult.message}`);
+    }
+    addLog('success', `${tag} WordPress post content successfully replaced! ID: ${replaceResult.postId}, link: ${replaceResult.postLink}`);
+    broadcastState();
+
+    addLog('info', `${tag} Updating Supabase status to completed...`);
+    broadcastState();
+    await updateKeywordStatus(settings, currentItem.id, 'completed');
+    addLog('success', `${tag} Supabase updated successfully.`);
+    broadcastState();
 
     state.stats.processed++;
     state.stats.remaining = state.queue.length - state.stats.processed;
@@ -2338,7 +2546,7 @@ async function runStateMachine(isInternal = false) {
           state.queue = keywords;
         }
 
-        if (settings.automationMode === 'article' || settings.automationMode === 'book') {
+        if (settings.automationMode === 'article' || settings.automationMode === 'book' || settings.automationMode === 'replace') {
           state.scheduleDates = settings.wpStatus === 'schedule' ? generateScheduleDates(state.queue.length, settings) : [];
         } else {
           state.scheduleDates = [];
@@ -2351,7 +2559,7 @@ async function runStateMachine(isInternal = false) {
         state.consecutiveFailures = 0;
         state.isRetryPhase = false;
         addLog('success', `Queue ready with ${state.queue.length} items.`);
-        if ((settings.automationMode === 'article' || settings.automationMode === 'book') && settings.wpStatus === 'schedule') {
+        if ((settings.automationMode === 'article' || settings.automationMode === 'book' || settings.automationMode === 'replace') && settings.wpStatus === 'schedule') {
           addLog('info', 'Generated schedules:\n' + state.scheduleDates.map((d, i) => `  - "${state.queue[i].keyword}" -> ${d}`).join('\n'));
         }
         saveState();
@@ -2423,7 +2631,7 @@ async function runStateMachine(isInternal = false) {
             broadcastState();
           }
 
-          if ((settings.automationMode === 'article' || settings.automationMode === 'book') && !settings.testMode) {
+          if ((settings.automationMode === 'article' || settings.automationMode === 'book' || settings.automationMode === 'replace') && !settings.testMode) {
             try {
               await updateKeywordStatus(settings, currentItem.id, 'failed');
             } catch(e) {}
