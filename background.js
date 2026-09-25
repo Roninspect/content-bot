@@ -1365,23 +1365,6 @@ async function publishToWordPress(settings, title, content, slug, scheduleDate =
   }
 
   try {
-    const duplicateCheck = await findExistingWordPressPost(settings, slug);
-    if (!duplicateCheck.success) {
-      return { success: false, message: `Duplicate check failed: ${duplicateCheck.message}` };
-    }
-
-    const existingPost = duplicateCheck.post;
-    if (existingPost) {
-      return {
-        success: true,
-        duplicate: true,
-        skipped: true,
-        postId: existingPost.id,
-        postStatus: existingPost.status,
-        postLink: existingPost.link || ''
-      };
-    }
-
     const endpoint = postsEndpoint;
     const operation = 'create';
 
@@ -1519,25 +1502,6 @@ async function publishBookArticle(payload, settings) {
   const baseUrl = normalizeWpUrl(settings && settings.wpUrl ? settings.wpUrl : 'https://bookspect.com');
   const endpoint = `${baseUrl}/wp-json/ronin-book-publisher/v1/articles`;
   const slug = payload.slug || sanitizeSlug(payload.keyword || payload.title);
-
-  // Pre-check: If post already exists (e.g. from previous run or retry), skip duplicate publishing
-  if (slug) {
-    try {
-      const duplicateCheck = await findExistingWordPressPost(settings, slug);
-      if (duplicateCheck && duplicateCheck.success && duplicateCheck.post) {
-        return {
-          success: true,
-          duplicate: true,
-          skipped: true,
-          articleId: duplicateCheck.post.id,
-          articleStatus: duplicateCheck.post.status || 'published',
-          data: duplicateCheck.post
-        };
-      }
-    } catch (e) {
-      // Continue to publishing if check fails
-    }
-  }
 
   console.log('[AutoAgent] Sending article to Bookspect articles endpoint...', endpoint);
 
@@ -1817,30 +1781,6 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
   addLog('info', `${tag} ${phaseStr}Processing keyword ${itemIndex + 1}/${totalCount}...`);
   broadcastState();
 
-  // Check the deterministic keyword slug before spending time generating content.
-  // Recheck again during publish to protect against races between parallel workers.
-  if (!settings.testMode) {
-    const initialSlug = sanitizeSlug(currentItem.keyword);
-    if (initialSlug) {
-      addLog('info', `${tag} Pre-checking WordPress slug "${initialSlug}" before generation...`);
-      broadcastState();
-      const existingCheck = await findExistingWordPressPost(settings, initialSlug);
-      if (!existingCheck.success) {
-        throw new Error(`WordPress duplicate pre-check failed: ${existingCheck.message}`);
-      }
-      if (existingCheck.post) {
-        addLog('success', `${tag} Existing WordPress slug found. Generation and upload skipped. Marking keyword completed. ID: ${existingCheck.post.id}, status: ${existingCheck.post.status}.`);
-        broadcastState();
-        await updateKeywordStatus(settings, currentItem.id, 'completed');
-        state.stats.processed++;
-        state.stats.remaining = Math.max(0, state.queue.length - state.stats.processed);
-        saveState();
-        broadcastState();
-        return;
-      }
-    }
-  }
-
   // 1. Open Grok tab
   const tab = await createTab('https://grok.com/');
 
@@ -2097,18 +2037,13 @@ async function processArticleKeyword(currentItem, itemIndex, totalCount, schedul
     const compiledH3Count = (finalHtml.match(/<h3\b/g) || []).length;
     const compiledTableCount = (finalHtml.match(/<table\b/g) || []).length;
     addLog('info', `${tag} WordPress formatting compiled: ${compiledH2Count} H2, ${compiledH3Count} H3, ${compiledTableCount} table(s).`);
-    addLog('info', `${tag} Checking WordPress for existing slug: "${slug}"...`);
     broadcastState();
 
     const wpResult = await publishToWordPress(settings, finalTitle, finalHtml, slug, scheduleDate);
     if (!wpResult.success) {
       throw new Error(`WordPress publishing failed: ${wpResult.message}`);
     }
-    if (wpResult.duplicate) {
-      addLog('success', `${tag} Existing WordPress slug found. WordPress upload skipped and the keyword will be marked completed. ID: ${wpResult.postId}, status: ${wpResult.postStatus}.`);
-    } else {
-      addLog('success', `${tag} New post uploaded to WordPress. ID: ${wpResult.postId}, status: ${wpResult.postStatus}.`);
-    }
+    addLog('success', `${tag} New post uploaded to WordPress. ID: ${wpResult.postId}, status: ${wpResult.postStatus}.`);
     broadcastState();
 
     addLog('info', `${tag} Updating Supabase status to completed...`);
@@ -2278,9 +2213,7 @@ async function processBookKeyword(currentItem, itemIndex, totalCount, scheduleDa
     broadcastState();
 
     const pubResult = await publishBookArticle(articleJson, settings);
-    if (pubResult.skipped) {
-      addLog('info', `${tag} Post already exists on WordPress (Post ID: ${pubResult.articleId}). Skipping duplicate creation.`);
-    } else if (pubResult.recoveredFromTimeout) {
+    if (pubResult.recoveredFromTimeout) {
       addLog('warning', `${tag} Server connection timed out after 30s, but verified article was created successfully on WordPress! Post ID: ${pubResult.articleId}.`);
     } else {
       addLog('success', `${tag} Published to Bookspect successfully! Article ID: ${pubResult.articleId}, Status: ${pubResult.articleStatus}.`);
